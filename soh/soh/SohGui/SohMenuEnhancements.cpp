@@ -1958,6 +1958,44 @@ void SohMenu::AddMenuEnhancements() {
             .CVar(timer.timeEnable)
             .Callback([](WidgetInfo& info) { TimeDisplayUpdateDisplayOptions(); });
     }
+
+    // SoH multiplayer: Local Co-op
+    path.sidebarName = "Local Co-op";
+    AddSidebarEntry("Enhancements", path.sidebarName, 1);
+    path.column = SECTION_COLUMN_1;
+
+    AddWidget(path, "Player 2", WIDGET_SEPARATOR_TEXT);
+    AddWidget(path, "Enable Local Co-op", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.Enabled"))
+        .Options(CheckboxOptions().Tooltip(
+            "Spawn a second Link controlled by Port 2.\n\n"
+            "P2 mirrors P1's currently-equipped item, shares the hearts/ammo/rupees pool, "
+            "and hides during cutscenes, dialog, and the pause menu. P2's bow/hookshot only "
+            "fire when Z-target lock-on is active.\n\n"
+            "Configure which physical controller drives Port 2 in Settings > Controller > Port 2.\n\n"
+            "Toggle takes effect on the next scene load. Use the 'Reload Current Scene' button "
+            "below or press L + D-pad-Down on Port 1 to apply immediately."));
+    AddWidget(path, "Reload Current Scene", WIDGET_BUTTON)
+        .Callback([](WidgetInfo& info) {
+            if (gPlayState != NULL) {
+                Play_TriggerSceneReload(gPlayState);
+            }
+        })
+        .Options(ButtonOptions()
+                     .Tooltip("Reload the current scene with a fast fade. Applies the co-op toggle "
+                              "and respawns P2 next to P1. Same as pressing L + D-pad-Down.")
+                     .Size(UIWidgets::Sizes::Inline));
+
+    AddWidget(path, "P2 Tunic Colors", WIDGET_SEPARATOR_TEXT);
+    AddWidget(path, "P2 Kokiri Tunic", WIDGET_CVAR_COLOR_PICKER)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.P2.KokiriTunic.Value"))
+        .Options(ColorPickerOptions().DefaultValue(Color_RGBA8{ 0xC8, 0x14, 0x14, 0xFF }));
+    AddWidget(path, "P2 Goron Tunic", WIDGET_CVAR_COLOR_PICKER)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.P2.GoronTunic.Value"))
+        .Options(ColorPickerOptions().DefaultValue(Color_RGBA8{ 0x40, 0x18, 0xA0, 0xFF }));
+    AddWidget(path, "P2 Zora Tunic", WIDGET_CVAR_COLOR_PICKER)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.P2.ZoraTunic.Value"))
+        .Options(ColorPickerOptions().DefaultValue(Color_RGBA8{ 0xE8, 0xC8, 0x30, 0xFF }));
 }
 
 } // namespace SohGui

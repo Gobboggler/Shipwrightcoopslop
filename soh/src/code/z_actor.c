@@ -2110,7 +2110,25 @@ s32 GiveItemEntryFromActorWithFixedRange(Actor* actor, PlayState* play, GetItemE
 
 // If you're doing something for randomizer, you're probably looking for GiveItemEntryFromActor
 s32 Actor_OfferGetItem(Actor* actor, PlayState* play, s32 getItemId, f32 xzRange, f32 yRange) {
-    Player* player = GET_PLAYER(play);
+    // SoH multiplayer: offer the item to whichever Player is closest.
+    Player* nearest = NULL;
+    f32 nearestDistSq = SQ(xzRange) + SQ(yRange);
+    Actor* p = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+    for (; p != NULL; p = p->next) {
+        f32 dx = actor->world.pos.x - p->world.pos.x;
+        f32 dz = actor->world.pos.z - p->world.pos.z;
+        f32 dy = actor->world.pos.y - p->world.pos.y;
+        f32 distSq = SQ(dx) + SQ(dz) + SQ(dy);
+        if (distSq < nearestDistSq) {
+            nearestDistSq = distSq;
+            nearest = (Player*)p;
+        }
+    }
+    if (nearest == NULL) {
+        return false;
+    }
+
+    Player* player = nearest;
 
     if (!(player->stateFlags1 &
           (PLAYER_STATE1_DEAD | PLAYER_STATE1_CHARGING_SPIN_ATTACK | PLAYER_STATE1_HANGING_OFF_LEDGE |
@@ -2121,8 +2139,12 @@ s32 Actor_OfferGetItem(Actor* actor, PlayState* play, s32 getItemId, f32 xzRange
              ((!IS_RANDO && ((getItemId > GI_NONE) && (getItemId < GI_MAX))) ||
               (IS_RANDO && ((getItemId > RG_NONE) && (getItemId < RG_MAX))))) ||
             (!(player->stateFlags1 & (PLAYER_STATE1_CARRYING_ACTOR | PLAYER_STATE1_IN_CUTSCENE)))) {
-            if ((actor->xzDistToPlayer < xzRange) && (fabsf(actor->yDistToPlayer) < yRange)) {
-                s16 yawDiff = actor->yawTowardsPlayer - player->actor.shape.rot.y;
+
+            f32 actorXZDist = Actor_WorldDistXZToActor(actor, &player->actor);
+            f32 actorYDist  = Actor_HeightDiff(actor, &player->actor);
+
+            if ((actorXZDist < xzRange) && (fabsf(actorYDist) < yRange)) {
+                s16 yawDiff = Actor_WorldYawTowardActor(actor, &player->actor) - player->actor.shape.rot.y;
                 s32 absYawDiff = ABS(yawDiff);
 
                 if ((getItemId != GI_NONE) || (player->getItemDirection < absYawDiff)) {
@@ -2662,11 +2684,47 @@ void Actor_UpdateAll(PlayState* play, ActorContext* actorCtx) {
                 }
             } else {
                 Math_Vec3f_Copy(&actor->prevPos, &actor->world.pos);
-                actor->xzDistToPlayer = Actor_WorldDistXZToActor(actor, &player->actor);
-                actor->yDistToPlayer = Actor_HeightDiff(actor, &player->actor);
-                actor->xyzDistToPlayerSq = SQ(actor->xzDistToPlayer) + SQ(actor->yDistToPlayer);
+                {
+                    // SoH multiplayer: pick whichever player is closer for
+                    // distance/yaw fields. Defensive: skip candidates with NaN
+                    // positions, and don't run the math at all if either side
+                    // has NaN — atan2 propagates NaN into a table-lookup index
+                    // and crashes the array read.
+                    Actor* coopNearest = &player->actor;
+                    f32 coopDist = Actor_WorldDistXYZToActor(actor, &player->actor);
+                    f32 coopNearestDistSq = (coopDist == coopDist) ? SQ(coopDist) : 3.4e38f;
 
-                actor->yawTowardsPlayer = Actor_WorldYawTowardActor(actor, &player->actor);
+                    if (actor->category != ACTORCAT_PLAYER &&
+                        actor->world.pos.x == actor->world.pos.x &&
+                        actor->world.pos.y == actor->world.pos.y &&
+                        actor->world.pos.z == actor->world.pos.z) {
+                        Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+                        for (coopP = coopP ? coopP->next : NULL; coopP != NULL; coopP = coopP->next) {
+                            if (coopP->world.pos.x != coopP->world.pos.x) continue;
+                            if (coopP->world.pos.y != coopP->world.pos.y) continue;
+                            if (coopP->world.pos.z != coopP->world.pos.z) continue;
+                            f32 d = Actor_WorldDistXYZToActor(actor, coopP);
+                            if (SQ(d) < coopNearestDistSq) {
+                                coopNearestDistSq = SQ(d);
+                                coopNearest = coopP;
+                            }
+                        }
+                    }
+
+                    // Only update fields if BOTH actor and target have finite
+                    // positions. Stale-by-one-frame is harmless; a crash is not.
+                    if (actor->world.pos.x == actor->world.pos.x &&
+                        actor->world.pos.y == actor->world.pos.y &&
+                        actor->world.pos.z == actor->world.pos.z &&
+                        coopNearest->world.pos.x == coopNearest->world.pos.x &&
+                        coopNearest->world.pos.y == coopNearest->world.pos.y &&
+                        coopNearest->world.pos.z == coopNearest->world.pos.z) {
+                        actor->xzDistToPlayer = Actor_WorldDistXZToActor(actor, coopNearest);
+                        actor->yDistToPlayer = Actor_HeightDiff(actor, coopNearest);
+                        actor->xyzDistToPlayerSq = SQ(actor->xzDistToPlayer) + SQ(actor->yDistToPlayer);
+                        actor->yawTowardsPlayer = Actor_WorldYawTowardActor(actor, coopNearest);
+                    }
+                }
                 actor->flags &= ~ACTOR_FLAG_SFX_FOR_PLAYER_BODY_HIT;
 
                 if ((DECR(actor->freezeTimer) == 0) &&
@@ -3250,6 +3308,19 @@ void Actor_AddToCategory(ActorContext* actorCtx, Actor* actorToAdd, u8 actorCate
     actorCtx->total++;
     actorCtx->actorLists[actorCategory].length++;
     prevHead = actorCtx->actorLists[actorCategory].head;
+
+    // SoH multiplayer: keep the primary Player as list head so GET_PLAYER
+    // continues to return P1. Additional players append to tail.
+    if (actorCategory == ACTORCAT_PLAYER && prevHead != NULL) {
+        Actor* tail = prevHead;
+        while (tail->next != NULL) {
+            tail = tail->next;
+        }
+        tail->next = actorToAdd;
+        actorToAdd->prev = tail;
+        actorToAdd->next = NULL;
+        return;
+    }
 
     if (prevHead != NULL) {
         prevHead->prev = actorToAdd;

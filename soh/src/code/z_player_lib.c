@@ -1077,6 +1077,30 @@ void Player_DrawImpl(PlayState* play, void** skeleton, Vec3s* jointTable, s32 dL
         color = &sTemp;
     }
 
+    // SoH multiplayer: when drawing a secondary player, override the tunic
+    // color with the P2-specific palette. `data` is the Player pointer (passed
+    // as `this` from Player_Draw); we sanity-check it's actually a player
+    // actor before reading PLAYER_GET_INDEX. Defaults match the menu defaults
+    // (red Kokiri, purple Goron, gold Zora). Picker UI lives in
+    // SohMenuEnhancements.cpp under the "Local Co-op" sidebar entry.
+    if (data != NULL && ((Player*)data)->actor.id == ACTOR_PLAYER &&
+        PLAYER_GET_INDEX(&((Player*)data)->actor) != 0) {
+        Color_RGB8 coopDefault;
+        if (tunic == PLAYER_TUNIC_KOKIRI) {
+            coopDefault.r = 0xC8; coopDefault.g = 0x14; coopDefault.b = 0x14;
+            sTemp = CVarGetColor24(CVAR_ENHANCEMENT("LocalCoop.P2.KokiriTunic.Value"), coopDefault);
+            color = &sTemp;
+        } else if (tunic == PLAYER_TUNIC_GORON) {
+            coopDefault.r = 0x40; coopDefault.g = 0x18; coopDefault.b = 0xA0;
+            sTemp = CVarGetColor24(CVAR_ENHANCEMENT("LocalCoop.P2.GoronTunic.Value"), coopDefault);
+            color = &sTemp;
+        } else if (tunic == PLAYER_TUNIC_ZORA) {
+            coopDefault.r = 0xE8; coopDefault.g = 0xC8; coopDefault.b = 0x30;
+            sTemp = CVarGetColor24(CVAR_ENHANCEMENT("LocalCoop.P2.ZoraTunic.Value"), coopDefault);
+            color = &sTemp;
+        }
+    }
+
     if (GameInteractor_Should(VB_APPLY_TUNIC_COLOR, true, data, color)) {
         gDPSetEnvColor(POLY_OPA_DISP++, color->r, color->g, color->b, 0);
     }

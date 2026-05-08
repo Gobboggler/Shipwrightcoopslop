@@ -7517,6 +7517,35 @@ Vec3s Camera_Update(Camera* camera) {
 
     if (camera->player != NULL) {
         Actor_GetWorldPosShapeRot(&curPlayerPosRot, &camera->player->actor);
+
+        // SoH multiplayer: midpoint hijack removed entirely. It caused jitter at
+        // the threshold boundary, broke Z-target (which only changes camera->mode,
+        // not camera->setting), and confused fixed-camera scenes that share
+        // CAM_SET_NORMAL0 with outdoor scenes. Camera now always tracks P1
+        // (vanilla behavior). Wide-camera benefit moved to FOV widening below.
+
+        // SoH multiplayer (Tier 1): when a non-P1 player is actively interacting
+        // (talking to an NPC, holding an item-get), point the camera at THEM
+        // instead of P1 for the duration. Detection is via talkActor — vanilla
+        // sets it when a Player initiates dialog with another actor.
+        // gameOverCtx is also a P1-takeover signal so P2 doesn't get camera
+        // even if their state happens to be active during P1 death.
+        {
+            Actor* coopP = camera->play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+            for (coopP = coopP ? coopP->next : NULL; coopP != NULL; coopP = coopP->next) {
+                Player* coopOther = (Player*)coopP;
+                if (coopOther->talkActor != NULL &&
+                    camera->play->msgCtx.msgMode != MSGMODE_NONE &&
+                    camera->play->gameOverCtx.state == GAMEOVER_INACTIVE &&
+                    coopP->world.pos.x == coopP->world.pos.x &&
+                    coopP->world.pos.y == coopP->world.pos.y &&
+                    coopP->world.pos.z == coopP->world.pos.z) {
+                    Actor_GetWorldPosShapeRot(&curPlayerPosRot, coopP);
+                    break;
+                }
+            }
+        }
+
         camera->xzSpeed = playerXZSpeed = OLib_Vec3fDistXZ(&curPlayerPosRot.pos, &camera->playerPosRot.pos);
 
         camera->speedRatio = OLib_ClampMaxDist(playerXZSpeed / (func_8002DCE4(camera->player) * PCT(OREG(8))), 1.0f);
@@ -7676,6 +7705,44 @@ Vec3s Camera_Update(Camera* camera) {
     } else {
         viewAt = camera->at;
         viewEye = camera->eye;
+
+        // SoH multiplayer: zoom out based on player spread during normal play.
+        // Only applies in modes where the camera is supposed to track the
+        // player — fixed cameras and prerendered backgrounds have hardcoded
+        // eye positions that would be distorted by this scaling.
+        if (!Play_InCsMode(camera->play)) {
+            s32 coopAllowZoom = 0;
+            switch (camera->setting) {
+                case CAM_SET_NORMAL0:
+                case CAM_SET_NORMAL1:
+                case CAM_SET_NORMAL3:
+                case CAM_SET_DUNGEON0:
+                case CAM_SET_DUNGEON1:
+                case CAM_SET_DUNGEON2:
+                case CAM_SET_HORSE:
+                    coopAllowZoom = 1;
+                    break;
+                default:
+                    coopAllowZoom = 0;
+                    break;
+            }
+            if (coopAllowZoom) {
+                Actor* coopP1 = camera->play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+                if (coopP1 != NULL && coopP1->next != NULL) {
+                    Actor* coopP2 = coopP1->next;
+                    if (coopP2->world.pos.x == coopP2->world.pos.x &&
+                        coopP2->world.pos.y == coopP2->world.pos.y &&
+                        coopP2->world.pos.z == coopP2->world.pos.z) {
+                        f32 coopSpread = OLib_Vec3fDist(&coopP1->world.pos, &coopP2->world.pos);
+                        f32 coopSpreadMul = 1.0f + (coopSpread / 300.0f);
+                        viewEye.x = viewAt.x + (viewEye.x - viewAt.x) * coopSpreadMul;
+                        viewEye.y = viewAt.y + (viewEye.y - viewAt.y) * coopSpreadMul;
+                        viewEye.z = viewAt.z + (viewEye.z - viewAt.z) * coopSpreadMul;
+                    }
+                }
+            }
+        }
+
         OLib_Vec3fDiffToVecSphGeo(&eyeAtAngle, &viewEye, &viewAt);
         Camera_CalcUpFromPitchYawRoll(&viewUp, eyeAtAngle.pitch, eyeAtAngle.yaw, camera->roll);
         viewFov = camera->fov;

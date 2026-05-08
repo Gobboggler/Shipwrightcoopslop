@@ -1563,6 +1563,7 @@ void func_800C08AC(PlayState* play, s16 camId, s16 arg2);
 void Play_SaveSceneFlags(PlayState* play);
 void Play_SetupRespawnPoint(PlayState* play, s32 respawnMode, s32 playerParams);
 void Play_TriggerVoidOut(PlayState* play);
+void Play_TriggerSceneReload(PlayState* play);
 void Play_TriggerRespawn(PlayState* play);
 s32 func_800C0CB8(PlayState* play);
 s32 FrameAdvance_IsEnabled(PlayState* play);

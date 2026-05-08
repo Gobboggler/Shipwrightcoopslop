@@ -2138,6 +2138,17 @@ void Play_TriggerVoidOut(PlayState* play) {
     play->transitionType = TRANS_TYPE_FADE_BLACK;
 }
 
+// SoH multiplayer: reload the current entrance with a fast fade. Useful for
+// iterating on co-op spawn behavior without going to the title screen.
+void Play_TriggerSceneReload(PlayState* play) {
+    gSaveContext.respawn[RESPAWN_MODE_DOWN].tempSwchFlags = play->actorCtx.flags.tempSwch;
+    gSaveContext.respawn[RESPAWN_MODE_DOWN].tempCollectFlags = play->actorCtx.flags.tempCollect;
+    gSaveContext.respawnFlag = 0;
+    play->nextEntranceIndex = gSaveContext.entranceIndex;
+    play->transitionTrigger = TRANS_TRIGGER_START;
+    play->transitionType = TRANS_TYPE_FADE_BLACK_FAST;
+}
+
 void Play_LoadToLastEntrance(PlayState* play) {
     gSaveContext.respawnFlag = -1;
     play->transitionTrigger = TRANS_TRIGGER_START;

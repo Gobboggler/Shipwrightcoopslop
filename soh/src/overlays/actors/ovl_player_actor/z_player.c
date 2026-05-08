@@ -169,6 +169,7 @@ void Player_StartMode_KnockedOver(PlayState* play, Player* this);
 void Player_StartMode_WarpSong(PlayState* play, Player* this);
 void Player_StartMode_FaroresWind(PlayState* play, Player* this);
 void Player_UpdateCommon(Player* this, PlayState* play, Input* input);
+void Player_Draw(Actor* thisx, PlayState* play2);
 void func_8084FF7C(Player* this);
 void Player_UpdateBunnyEars(Player* this);
 void func_80851008(PlayState* play, Player* this, void* anim);
@@ -5851,6 +5852,11 @@ void func_8083AA10(Player* this, PlayState* play) {
 s32 func_8083AD4C(PlayState* play, Player* this) {
     s32 camMode;
 
+    // SoH multiplayer: P2 doesn't trigger first-person aim modes.
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        return 0;
+    }
+
     if (this->unk_6AD == 2) {
         if (func_8002DD6C(this)) {
             bool shouldUseBowCamera = LINK_IS_ADULT;
@@ -10813,6 +10819,35 @@ void Player_Init(Actor* thisx, PlayState* play2) {
     s32 respawnFlag;
     s32 respawnMode;
 
+    // SoH multiplayer: secondary players do skeleton/anim setup only.
+    if (PLAYER_GET_INDEX(thisx) != 0) {
+        this->ageProperties = &sAgeProperties[gSaveContext.linkAge];
+        this->itemAction = this->heldItemAction = -1;
+        this->heldItemId = ITEM_NONE;
+        Player_UseItem(play, this, ITEM_NONE);
+        Player_SetEquipmentData(play, this);
+        Player_InitCommon(this, play, gPlayerSkelHeaders[((void)0, gSaveContext.linkAge)]);
+        this->giObjectSegment = (void*)(((uintptr_t)ZELDA_ARENA_MALLOC_DEBUG(0x3008) + 8) & ~0xF);
+        thisx->room = play->roomCtx.curRoom.num;
+        // SoH multiplayer: install a valid action callback so P2's update doesn't
+        // jump through a NULL actionFunc. Idle is safe — P2 isn't running scripted
+        // entrance cutscenes anyway (we hide P2 during cutscenes).
+        Player_SetupAction(play, this, Player_Action_Idle, 0);
+        Player_AnimPlayLoop(play, this, Player_GetIdleAnim(this));
+        // SoH multiplayer: physics state init that vanilla normally does inside
+        // sStartModeFuncs (specifically func_80838E70 sets unk_450). Without
+        // this, deltas like (world.pos - unk_450) start enormous and feed NaN
+        // into normalize/atan calls a few frames later.
+        this->unk_450 = thisx->world.pos;
+        this->unk_45C = thisx->world.pos;
+        // SoH multiplayer: secondary players don't get their own Navi. Spawning
+        // a second fairy creates a parent pointer that becomes stale during
+        // scene transitions and hangs the unload path. P2 just uses no Navi;
+        // the existing GetFairyOwner head fallback in z_en_elf.c handles this.
+        this->naviActor = NULL;
+        return;
+    }
+
     play->shootingGalleryStatus = play->bombchuBowlingStatus = 0;
 
     play->playerInit = Player_InitCommon;
@@ -10933,6 +10968,35 @@ void Player_Init(Actor* thisx, PlayState* play2) {
 
     Map_SavePlayerInitialInfo(play);
     MREG(64) = 0;
+
+    // SoH multiplayer: auto-spawn P2 with a floor sanity check.
+    // Toggle via console: cvar_set gEnhancements.LocalCoop.Enabled 1
+    if (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0)) {
+        f32 sinY = Math_SinS(thisx->shape.rot.y);
+        f32 cosY = Math_CosS(thisx->shape.rot.y);
+        Vec3f spawnPos;
+        spawnPos.x = thisx->world.pos.x - sinY * 50.0f;
+        spawnPos.y = thisx->world.pos.y + 30.0f;
+        spawnPos.z = thisx->world.pos.z - cosY * 50.0f;
+
+        CollisionPoly* coopFloorPoly;
+        Vec3f coopRaycastFrom = spawnPos;
+        f32 coopFloorY = BgCheck_AnyRaycastFloor1(&play->colCtx, &coopFloorPoly, &coopRaycastFrom);
+
+        // Defensive: any non-finite or below-world result falls back to spawning
+        // P2 directly on top of P1. Without this, a NaN floorY produces a P2
+        // with NaN world.pos and crashes Actor_UpdateAll's atan2 path.
+        if (coopFloorY <= BGCHECK_Y_MIN || coopFloorY != coopFloorY) {
+            spawnPos = thisx->world.pos;
+        } else {
+            spawnPos.y = coopFloorY;
+        }
+
+        Actor_Spawn(&play->actorCtx, play, ACTOR_PLAYER,
+                    spawnPos.x, spawnPos.y, spawnPos.z,
+                    0, thisx->shape.rot.y, 0,
+                    PLAYER_PARAMS_WITH_INDEX(0x0D00, 1));
+    }
 }
 
 void Player_ApproachZeroBinang(s16* pValue) {
@@ -11855,6 +11919,66 @@ void Player_UpdateCommon(Player* this, PlayState* play, Input* input) {
 
     sControlInput = input;
 
+    // SoH multiplayer dev hotkey: L + D-pad-Down reloads the current scene.
+    if (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0) &&
+        PLAYER_GET_INDEX(&this->actor) == 0 &&
+        CHECK_BTN_ALL(play->state.input[0].cur.button, BTN_L) &&
+        CHECK_BTN_ALL(play->state.input[0].press.button, BTN_DDOWN)) {
+        Play_TriggerSceneReload(play);
+        return;
+    }
+
+    // SoH multiplayer: warp hotkeys (P1 holding L on Port 1 only).
+    //   L + D-pad-Up    -> teleport P2 to P1's current position
+    //   L + D-pad-Right -> teleport P1 to P2's current position
+    if (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0) &&
+        PLAYER_GET_INDEX(&this->actor) == 0 &&
+        CHECK_BTN_ALL(play->state.input[0].cur.button, BTN_L)) {
+        Player* coopP2 = NULL;
+        Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        for (coopP = coopP ? coopP->next : NULL; coopP != NULL; coopP = coopP->next) {
+            if (coopP->category == ACTORCAT_PLAYER && coopP != &this->actor) {
+                coopP2 = (Player*)coopP;
+                break;
+            }
+        }
+        if (coopP2 != NULL) {
+            if (CHECK_BTN_ALL(play->state.input[0].press.button, BTN_DUP)) {
+                // Warp P2 to P1
+                coopP2->actor.world.pos = this->actor.world.pos;
+                coopP2->actor.prevPos = this->actor.world.pos;
+                coopP2->actor.home.pos = this->actor.world.pos;
+                coopP2->actor.velocity.x = coopP2->actor.velocity.y = coopP2->actor.velocity.z = 0.0f;
+                coopP2->linearVelocity = 0.0f;
+                coopP2->actor.speedXZ = 0.0f;
+                coopP2->unk_450 = this->actor.world.pos;
+                coopP2->unk_45C = this->actor.world.pos;
+            } else if (CHECK_BTN_ALL(play->state.input[0].press.button, BTN_DRIGHT)) {
+                // Warp P1 to P2
+                this->actor.world.pos = coopP2->actor.world.pos;
+                this->actor.prevPos = coopP2->actor.world.pos;
+                this->actor.home.pos = coopP2->actor.world.pos;
+                this->actor.velocity.x = this->actor.velocity.y = this->actor.velocity.z = 0.0f;
+                this->linearVelocity = 0.0f;
+                this->actor.speedXZ = 0.0f;
+                this->unk_450 = coopP2->actor.world.pos;
+                this->unk_45C = coopP2->actor.world.pos;
+            }
+        }
+    }
+
+    // SoH multiplayer: secondary players mirror P1's currently-held item, but
+    // only on draw events — never on sheath. This means when P1 draws their
+    // sword, P2 also draws it. When P1 sheathes, P2 keeps the sword out so
+    // P2 can keep swinging independently.
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        Player* p1 = (Player*)play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        if (p1 != NULL && p1 != this && p1->heldItemId != this->heldItemId &&
+            p1->heldItemId != ITEM_NONE) {
+            Player_UseItem(play, this, p1->heldItemId);
+        }
+    }
+
     if (this->unk_A86 < 0) {
         this->unk_A86++;
         if (this->unk_A86 == 0) {
@@ -12272,6 +12396,26 @@ void Player_Update(Actor* thisx, PlayState* play) {
     Input sp44;
     Actor* dog;
 
+    // SoH multiplayer: secondary players hide and freeze during any cutscene,
+    // dialog, item-get, gameover, pause, or scene transition. P1 still runs as
+    // normal. transitionTrigger fires when a fade starts; transitionMode is
+    // non-zero while the fade is rendering — both must be checked to fully
+    // hide P2 across the entire transition window.
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        if (Play_InCsMode(play) ||
+            play->pauseCtx.state != 0 ||
+            play->pauseCtx.debugState != 0 ||
+            play->gameOverCtx.state != GAMEOVER_INACTIVE ||
+            play->transitionTrigger != TRANS_TRIGGER_OFF ||
+            play->transitionMode != 0 ||
+            play->msgCtx.msgMode != MSGMODE_NONE) {
+            this->actor.draw = NULL;
+            return;
+        } else {
+            this->actor.draw = Player_Draw;
+        }
+    }
+
     if (Player_UpdateNoclip(this, play)) {
         if (gSaveContext.dogParams < 0) {
             // Disable object dependency to prevent losing dog in scenes other than market
@@ -12303,7 +12447,8 @@ void Player_Update(Actor* thisx, PlayState* play) {
         if (this->stateFlags1 & (PLAYER_STATE1_INPUT_DISABLED | PLAYER_STATE1_IN_CUTSCENE)) {
             memset(&sp44, 0, sizeof(sp44));
         } else {
-            sp44 = play->state.input[0];
+            // SoH multiplayer: route input by player index. P1=slot0, P2=slot1.
+            sp44 = play->state.input[PLAYER_GET_INDEX(&this->actor)];
             if (this->textboxBtnCooldownTimer != 0) {
                 sp44.cur.button &= ~(BTN_A | BTN_B | BTN_CUP);
                 sp44.press.button &= ~(BTN_A | BTN_B | BTN_CUP);
@@ -12389,6 +12534,45 @@ void Player_Update(Actor* thisx, PlayState* play) {
         player->pushedSpeed = 3.0f;
         // Play fan sound (too annoying)
         // func_8002F974(&player->actor, NA_SE_EV_WIND_TRAP - SFX_FLAG);
+    }
+
+    // SoH multiplayer: P2 watchdog. Recovers from two failure modes:
+    //   1. NaN crept into position/velocity (math bug elsewhere in update path).
+    //   2. P2 got separated from P1 by more than 5000 units. This catches
+    //      cutscenes that teleport P1 (Deku Baba pre-Deku-Tree, owl drops,
+    //      etc.) leaving P2 stranded in the previous spot.
+    // Either way: snap P2 to P1 with zero velocity. Stale-by-one-frame
+    // distance/yaw fields are harmless; a missing P2 is not.
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        Player* coopP1 = (Player*)play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        if (coopP1 != NULL && coopP1 != this) {
+            s32 coopBad = 0;
+            if (this->actor.world.pos.x != this->actor.world.pos.x) coopBad = 1;
+            if (this->actor.world.pos.y != this->actor.world.pos.y) coopBad = 1;
+            if (this->actor.world.pos.z != this->actor.world.pos.z) coopBad = 1;
+            if (this->actor.velocity.x != this->actor.velocity.x) coopBad = 1;
+            if (this->actor.velocity.y != this->actor.velocity.y) coopBad = 1;
+            if (this->actor.velocity.z != this->actor.velocity.z) coopBad = 1;
+            if (!coopBad) {
+                f32 coopDx = this->actor.world.pos.x - coopP1->actor.world.pos.x;
+                f32 coopDy = this->actor.world.pos.y - coopP1->actor.world.pos.y;
+                f32 coopDz = this->actor.world.pos.z - coopP1->actor.world.pos.z;
+                f32 coopDistSq = coopDx*coopDx + coopDy*coopDy + coopDz*coopDz;
+                if (coopDistSq > 25000000.0f) coopBad = 1;  // (5000 units)^2
+            }
+            if (coopBad) {
+                this->actor.world.pos = coopP1->actor.world.pos;
+                this->actor.prevPos = coopP1->actor.world.pos;
+                this->actor.home.pos = coopP1->actor.world.pos;
+                this->actor.velocity.x = 0.0f;
+                this->actor.velocity.y = 0.0f;
+                this->actor.velocity.z = 0.0f;
+                this->linearVelocity = 0.0f;
+                this->actor.speedXZ = 0.0f;
+                this->unk_450 = coopP1->actor.world.pos;
+                this->unk_45C = coopP1->actor.world.pos;
+            }
+        }
     }
 
     GameInteractor_ExecuteOnPlayerUpdate();
