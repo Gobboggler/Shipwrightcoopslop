@@ -11,6 +11,20 @@
 
 #define FLAGS ACTOR_FLAG_UPDATE_CULLING_DISABLED
 
+// SoH multiplayer: clears PLAYER_STATE2_MOVING_DYNAPOLY on every player
+// actor in the scene, not just P1. The vanilla code uses GET_PLAYER (which
+// returns P1) and clears only their flag; if P2 was the one pushing the
+// block, P2's flag stays set forever and P2 gets locked into the block.
+// Clearing on all players is safe because only one player's flag is set at
+// any given moment for a single block — clearing P1's flag when P2 was the
+// pusher is a no-op, and vice versa.
+static void Coop_ClearMovingDynapolyOnAllPlayers(PlayState* play) {
+    Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+    for (; coopP != NULL; coopP = coopP->next) {
+        ((Player*)coopP)->stateFlags2 &= ~PLAYER_STATE2_MOVING_DYNAPOLY;
+    }
+}
+
 void ObjOshihiki_Init(Actor* thisx, PlayState* play);
 void ObjOshihiki_Destroy(Actor* thisx, PlayState* play);
 void ObjOshihiki_Update(Actor* thisx, PlayState* play);
@@ -469,7 +483,6 @@ void ObjOshihiki_SetupOnScene(ObjOshihiki* this, PlayState* play) {
 
 void ObjOshihiki_OnScene(ObjOshihiki* this, PlayState* play) {
     s32 pad;
-    Player* player = GET_PLAYER(play);
 
     this->stateFlags |= PUSHBLOCK_ON_SCENE;
     if ((this->timer <= 0) && (fabsf(this->dyna.unk_150) > 0.001f)) {
@@ -478,11 +491,11 @@ void ObjOshihiki_OnScene(ObjOshihiki* this, PlayState* play) {
             this->direction = this->dyna.unk_150;
             ObjOshihiki_SetupPush(this, play);
         } else {
-            player->stateFlags2 &= ~PLAYER_STATE2_MOVING_DYNAPOLY;
+            Coop_ClearMovingDynapolyOnAllPlayers(play);
             this->dyna.unk_150 = 0.0f;
         }
     } else {
-        player->stateFlags2 &= ~PLAYER_STATE2_MOVING_DYNAPOLY;
+        Coop_ClearMovingDynapolyOnAllPlayers(play);
         this->dyna.unk_150 = 0.0f;
     }
 }
@@ -496,7 +509,6 @@ void ObjOshihiki_SetupOnActor(ObjOshihiki* this, PlayState* play) {
 
 void ObjOshihiki_OnActor(ObjOshihiki* this, PlayState* play) {
     s32 bgId;
-    Player* player = GET_PLAYER(play);
     DynaPolyActor* dynaPolyActor;
 
     this->stateFlags |= PUSHBLOCK_ON_ACTOR;
@@ -519,11 +531,11 @@ void ObjOshihiki_OnActor(ObjOshihiki* this, PlayState* play) {
                         this->direction = this->dyna.unk_150;
                         ObjOshihiki_SetupPush(this, play);
                     } else {
-                        player->stateFlags2 &= ~PLAYER_STATE2_MOVING_DYNAPOLY;
+                        Coop_ClearMovingDynapolyOnAllPlayers(play);
                         this->dyna.unk_150 = 0.0f;
                     }
                 } else {
-                    player->stateFlags2 &= ~PLAYER_STATE2_MOVING_DYNAPOLY;
+                    Coop_ClearMovingDynapolyOnAllPlayers(play);
                     this->dyna.unk_150 = 0.0f;
                 }
             } else {
@@ -556,7 +568,6 @@ void ObjOshihiki_SetupPush(ObjOshihiki* this, PlayState* play) {
 
 void ObjOshihiki_Push(ObjOshihiki* this, PlayState* play) {
     Actor* thisx = &this->dyna.actor;
-    Player* player = GET_PLAYER(play);
     f32 pushDistSigned;
     s32 stopFlag;
 
@@ -571,20 +582,19 @@ void ObjOshihiki_Push(ObjOshihiki* this, PlayState* play) {
     if (!ObjOshihiki_CheckFloor(this, play)) {
         thisx->home.pos.x = thisx->world.pos.x;
         thisx->home.pos.z = thisx->world.pos.z;
-        player->stateFlags2 &= ~PLAYER_STATE2_MOVING_DYNAPOLY;
+        Coop_ClearMovingDynapolyOnAllPlayers(play);
         this->dyna.unk_150 = 0.0f;
         this->pushDist = 0.0f;
         this->pushSpeed = 0.0f;
         ObjOshihiki_SetupFall(this, play);
     } else if (stopFlag) {
-        player = GET_PLAYER(play);
         if (ObjOshihiki_CheckWall(play, this->dyna.unk_158, this->dyna.unk_150, this)) {
             Audio_PlayActorSound2(thisx, NA_SE_EV_BLOCK_BOUND);
         }
 
         thisx->home.pos.x = thisx->world.pos.x;
         thisx->home.pos.z = thisx->world.pos.z;
-        player->stateFlags2 &= ~PLAYER_STATE2_MOVING_DYNAPOLY;
+        Coop_ClearMovingDynapolyOnAllPlayers(play);
         this->dyna.unk_150 = 0.0f;
         this->pushDist = 0.0f;
         this->pushSpeed = 0.0f;
@@ -607,12 +617,11 @@ void ObjOshihiki_SetupFall(ObjOshihiki* this, PlayState* play) {
 }
 
 void ObjOshihiki_Fall(ObjOshihiki* this, PlayState* play) {
-    Player* player = GET_PLAYER(play);
 
     this->stateFlags |= PUSHBLOCK_FALL;
     if (fabsf(this->dyna.unk_150) > 0.001f) {
         this->dyna.unk_150 = 0.0f;
-        player->stateFlags2 &= ~PLAYER_STATE2_MOVING_DYNAPOLY;
+        Coop_ClearMovingDynapolyOnAllPlayers(play);
     }
     Actor_MoveXZGravity(&this->dyna.actor);
     if (ObjOshihiki_CheckGround(this, play)) {

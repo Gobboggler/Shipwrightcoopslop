@@ -498,6 +498,7 @@ void Actor_SpawnTransitionActors(PlayState* play, ActorContext* actorCtx);
 Actor* Actor_SpawnEntry(ActorContext* actorCtx, ActorEntry* actorEntry, PlayState* play);
 Actor* Actor_Delete(ActorContext* actorCtx, Actor* actor, PlayState* play);
 Actor* func_80032AF0(PlayState* play, ActorContext* actorCtx, Actor** actorPtr, Player* player);
+Actor* Coop_FindTargetForPlayer(PlayState* play, ActorContext* actorCtx, Player* caller);
 Actor* Actor_Find(ActorContext* actorCtx, s32 actorId, s32 actorCategory);
 void Enemy_StartFinishingBlow(PlayState* play, Actor* actor);
 s16 func_80032CB4(s16* arg0, s16 arg1, s16 arg2, s16 arg3);
@@ -1563,6 +1564,11 @@ void func_800C08AC(PlayState* play, s16 camId, s16 arg2);
 void Play_SaveSceneFlags(PlayState* play);
 void Play_SetupRespawnPoint(PlayState* play, s32 respawnMode, s32 playerParams);
 void Play_TriggerVoidOut(PlayState* play);
+void Play_TriggerSceneReload(PlayState* play);
+// SoH multiplayer: returns 1 if split-screen PiP is active for this
+// scene (either via CVAR_ENHANCEMENT("LocalCoop.PiPPrototype") or
+// a force-list of scenes that always use PiP, like Twinrova).
+s32 Coop_PiPActiveForScene(PlayState* play);
 void Play_TriggerRespawn(PlayState* play);
 s32 func_800C0CB8(PlayState* play);
 s32 FrameAdvance_IsEnabled(PlayState* play);

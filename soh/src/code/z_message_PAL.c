@@ -159,24 +159,51 @@ void Message_UpdateOcarinaGame(PlayState* play) {
 
 u8 Message_ShouldAdvance(PlayState* play) {
     Input* input = &play->state.input[0];
+    // SoH multiplayer: when co-op is on, also accept P2's button presses
+    // for dialog advancement. Without this, P2 cannot dismiss the
+    // "You got X!" textbox after opening a chest, getting an item from
+    // an NPC, etc., because Message_ShouldAdvance hardcodes Port 0 input.
+    // Result: P2 stuck in item-get pose forever until P1 dismisses for
+    // them. Either player should be able to advance dialog.
+    Input* input2 = (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0))
+                        ? &play->state.input[1] : NULL;
 
-    bool isB_Held = CVarGetInteger(CVAR_ENHANCEMENT("SkipText"), 0) != 0 ? CHECK_BTN_ALL(input->cur.button, BTN_B)
-                                                                         : CHECK_BTN_ALL(input->press.button, BTN_B);
+    bool isB_Held = CVarGetInteger(CVAR_ENHANCEMENT("SkipText"), 0) != 0
+                        ? (CHECK_BTN_ALL(input->cur.button, BTN_B) ||
+                           (input2 != NULL && CHECK_BTN_ALL(input2->cur.button, BTN_B)))
+                        : (CHECK_BTN_ALL(input->press.button, BTN_B) ||
+                           (input2 != NULL && CHECK_BTN_ALL(input2->press.button, BTN_B)));
 
-    if (CHECK_BTN_ALL(input->press.button, BTN_A) || isB_Held || CHECK_BTN_ALL(input->press.button, BTN_CUP)) {
+    bool isAdvance = CHECK_BTN_ALL(input->press.button, BTN_A) ||
+                     CHECK_BTN_ALL(input->press.button, BTN_CUP) ||
+                     isB_Held ||
+                     (input2 != NULL && (CHECK_BTN_ALL(input2->press.button, BTN_A) ||
+                                          CHECK_BTN_ALL(input2->press.button, BTN_CUP)));
+
+    if (isAdvance) {
         Audio_PlaySoundGeneral(NA_SE_SY_MESSAGE_PASS, &gSfxDefaultPos, 4, &gSfxDefaultFreqAndVolScale,
                                &gSfxDefaultFreqAndVolScale, &gSfxDefaultReverb);
     }
-    return CHECK_BTN_ALL(input->press.button, BTN_A) || isB_Held || CHECK_BTN_ALL(input->press.button, BTN_CUP);
+    return isAdvance;
 }
 
 u8 Message_ShouldAdvanceSilent(PlayState* play) {
     Input* input = &play->state.input[0];
+    // SoH multiplayer: also accept P2 input — see Message_ShouldAdvance.
+    Input* input2 = (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0))
+                        ? &play->state.input[1] : NULL;
 
-    bool isB_Held = CVarGetInteger(CVAR_ENHANCEMENT("SkipText"), 0) != 0 ? CHECK_BTN_ALL(input->cur.button, BTN_B)
-                                                                         : CHECK_BTN_ALL(input->press.button, BTN_B);
+    bool isB_Held = CVarGetInteger(CVAR_ENHANCEMENT("SkipText"), 0) != 0
+                        ? (CHECK_BTN_ALL(input->cur.button, BTN_B) ||
+                           (input2 != NULL && CHECK_BTN_ALL(input2->cur.button, BTN_B)))
+                        : (CHECK_BTN_ALL(input->press.button, BTN_B) ||
+                           (input2 != NULL && CHECK_BTN_ALL(input2->press.button, BTN_B)));
 
-    return CHECK_BTN_ALL(input->press.button, BTN_A) || isB_Held || CHECK_BTN_ALL(input->press.button, BTN_CUP);
+    return CHECK_BTN_ALL(input->press.button, BTN_A) ||
+           CHECK_BTN_ALL(input->press.button, BTN_CUP) ||
+           isB_Held ||
+           (input2 != NULL && (CHECK_BTN_ALL(input2->press.button, BTN_A) ||
+                                CHECK_BTN_ALL(input2->press.button, BTN_CUP)));
 }
 
 /**

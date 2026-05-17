@@ -77,6 +77,17 @@ extern void EnGe1_Wait_Archery(EnGe1* enGe1, PlayState* play);
 extern void EnGe1_SetAnimationIdle(EnGe1* enGe1);
 extern void EnGe1_SetAnimationIdle(EnGe1* enGe1);
 extern void EnGe2_SetupCapturePlayer(EnGe2* enGe2, PlayState* play);
+
+// SoH multiplayer: pointer set/cleared by Player_UpdateCommon in
+// z_player.c around the GameInteractor_ExecuteOnPlayerUpdate call so
+// hook handlers below can tell which player triggered them. Declared
+// here at namespace scope (inside the existing extern "C" block) —
+// C++ doesn't allow extern "C" linkage specifications inside a
+// function body, which is what the build failure was complaining
+// about. The symbol itself is defined as a plain `Player*` global
+// (no `static`) in z_player.c, so this is a forward declaration with
+// C linkage.
+extern Player* sCurrentlyUpdatingPlayer;
 }
 
 bool LocMatchesQuest(Rando::Location loc) {
@@ -229,6 +240,44 @@ static std::queue<RandomizerCheck> randomizerQueuedChecks;
 static RandomizerCheck randomizerQueuedCheck = RC_UNKNOWN_CHECK;
 static GetItemEntry randomizerQueuedItemEntry = GET_ITEM_NONE;
 
+// SoH multiplayer: several randomizer handlers below register against
+// GameInteractor::OnPlayerUpdate, which fires once per Player_UpdateCommon
+// call. With local co-op enabled there are TWO Player actors in the
+// scene (P1 + P2), so OnPlayerUpdate fires TWICE per frame — once for
+// each player's update tick. The handlers all resolve "the player" via
+// GET_PLAYER(gPlayState) which always returns P1, and write back to P1's
+// Player struct, save context, or global queue state. Running them a
+// second time per frame is at best wasteful duplicate work, and at
+// worst produces non-idempotent side effects:
+//   - Item-queue handler logs "Attempting to give" twice per real
+//     frame (visible in the crash log that prompted this fix).
+//   - Lambda hooks that mutate transition state can re-trigger
+//     in-progress transitions.
+//   - Anything that writes player->getItemId or play->transitionTrigger
+//     gets stomped a second time even when the first call already
+//     kicked off the right state machine.
+//
+// Gate via sCurrentlyUpdatingPlayer (set/cleared around
+// GameInteractor_ExecuteOnPlayerUpdate inside Player_UpdateCommon in
+// z_player.c). When that pointer's PLAYER_GET_INDEX is 0 the call is
+// from P1's update tick; when 1, it's P2's tick and we skip the
+// randomizer handler entirely.
+//
+// Fail-open: if gPlayState or the pointer is null (running outside the
+// normal update loop, single-player run that doesn't set the pointer,
+// older save loaded against an upgraded build, etc.) we allow the
+// handler to run. Single-player has only one Player actor so this can
+// only ever fire once per frame regardless of the gate.
+static bool RandomizerHookShouldRunForCurrentPlayer() {
+    if (gPlayState == nullptr) return true;
+    // sCurrentlyUpdatingPlayer is forward-declared at namespace scope
+    // inside the extern "C" block at the top of this file. Defined in
+    // z_player.c as a non-static Player* global; set/cleared around
+    // GameInteractor_ExecuteOnPlayerUpdate inside Player_UpdateCommon.
+    if (sCurrentlyUpdatingPlayer == nullptr) return true;
+    return PLAYER_GET_INDEX(&sCurrentlyUpdatingPlayer->actor) == 0;
+}
+
 void RandomizerOnFlagSetHandler(int16_t flagType, int16_t flag) {
     // Consume adult trade items
     if (RAND_GET_OPTION(RSK_SHUFFLE_ADULT_TRADE) && flagType == FLAG_RANDOMIZER_INF) {
@@ -350,6 +399,7 @@ void RandomizerOnSceneFlagSetHandler(int16_t sceneNum, int16_t flagType, int16_t
 static Vec3f spawnPos = { 0.0f, -999.0f, 0.0f };
 
 void RandomizerOnPlayerUpdateForRCQueueHandler() {
+    if (!RandomizerHookShouldRunForCurrentPlayer()) return;
     // If we're already queued, don't queue again
     if (randomizerQueuedCheck != RC_UNKNOWN_CHECK)
         return;
@@ -405,6 +455,7 @@ void RandomizerOnPlayerUpdateForRCQueueHandler() {
 }
 
 void RandomizerOnPlayerUpdateForItemQueueHandler() {
+    if (!RandomizerHookShouldRunForCurrentPlayer()) return;
     if (randomizerQueuedCheck == RC_UNKNOWN_CHECK)
         return;
 
@@ -506,6 +557,7 @@ void RandomizerOnItemReceiveHandler(GetItemEntry receivedItemEntry) {
         !CVarGetInteger(CVAR_ENHANCEMENT("TimeSavers.SkipCutscene.Story"), IS_RANDO)) {
         static uint32_t updateHook;
         updateHook = GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayerUpdate>([]() {
+            if (!RandomizerHookShouldRunForCurrentPlayer()) return;
             Player* player = GET_PLAYER(gPlayState);
             if (player == NULL || Player_InBlockingCsMode(gPlayState, player) ||
                 player->stateFlags1 & PLAYER_STATE1_IN_ITEM_CS || player->stateFlags1 & PLAYER_STATE1_GETTING_ITEM ||
@@ -2024,6 +2076,7 @@ void RandomizerOnSceneInitHandler(int16_t sceneNum) {
         return;
 
     updateHook = GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayerUpdate>([]() {
+        if (!RandomizerHookShouldRunForCurrentPlayer()) return;
         if (!Flags_GetEventChkInf(EVENTCHKINF_LEARNED_PRELUDE_OF_LIGHT) && LINK_IS_ADULT &&
             CHECK_QUEST_ITEM(QUEST_MEDALLION_FOREST) && gPlayState->roomCtx.curRoom.num == 0) {
             Flags_SetEventChkInf(EVENTCHKINF_LEARNED_PRELUDE_OF_LIGHT);
@@ -2598,6 +2651,7 @@ std::unordered_map<s32, SpecialRespawnInfo> swimSpecialRespawnInfo = {
 f32 triforcePieceScale;
 
 void RandomizerOnPlayerUpdateHandler() {
+    if (!RandomizerHookShouldRunForCurrentPlayer()) return;
     if ((GET_PLAYER(gPlayState)->stateFlags1 & PLAYER_STATE1_IN_WATER) && !Flags_GetRandomizerInf(RAND_INF_CAN_SWIM) &&
         CUR_EQUIP_VALUE(EQUIP_TYPE_BOOTS) != EQUIP_VALUE_BOOTS_IRON) {
         // if you void out in water temple without swim you get instantly kicked out to prevent softlocks

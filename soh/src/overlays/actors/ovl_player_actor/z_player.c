@@ -169,6 +169,7 @@ void Player_StartMode_KnockedOver(PlayState* play, Player* this);
 void Player_StartMode_WarpSong(PlayState* play, Player* this);
 void Player_StartMode_FaroresWind(PlayState* play, Player* this);
 void Player_UpdateCommon(Player* this, PlayState* play, Input* input);
+void Player_Draw(Actor* thisx, PlayState* play2);
 void func_8084FF7C(Player* this);
 void Player_UpdateBunnyEars(Player* this);
 void func_80851008(PlayState* play, Player* this, void* anim);
@@ -411,6 +412,114 @@ static s32 D_80858AA0;
 static s32 sSavedCurrentMask;
 static Vec3f sInteractWallCheckResult;
 static Input* sControlInput;
+
+// SoH multiplayer: smoothed P2 camera yaw + pitch — a stable approximation
+// of "where P2's camera is facing" for split-screen / PiP rendering. Yaw
+// lags behind P2's actual facing direction (smooth follow). Pitch starts
+// neutral and is controlled by Port 2's right stick (Y axis) when the
+// FreeLook enhancement is enabled. Used for:
+//   1. P2's stick-to-world conversion (so stick "up" means a stable
+//      direction, not "wherever P2 is currently facing this frame")
+//   2. The split-screen PiP camera in z_play.c (extern reference there)
+// Updated every frame in Player_UpdateCommon for P2 actors. Resets to
+// P2's facing direction (yaw) and neutral pitch on Port 2: L when P1 is
+// not Z-target locked.
+//
+// Why a stable yaw matters: vanilla's Camera_GetInputDirYaw uses the
+// camera's facing direction, which lags behind player movement. Stick
+// "up" is therefore a fixed world direction for the duration of that
+// frame's input. If we used P2's current shape.rot.y (which changes
+// instant-frame from movement), we'd get a feedback loop — stick "up"
+// pushes P2 to face "up" which then makes "up" the new stick direction.
+// This is what made movement nonsensical in the previous round.
+//
+// Right stick controls (Port 2): when SoH FreeLook is enabled, P2's
+// right stick X adds to camera yaw and right stick Y adjusts pitch.
+// Otherwise the camera passively follows P2's facing.
+f32 gCoopP2CameraYaw = 0.0f;
+f32 gCoopP2CameraPitch = 0.0f;
+s32 gCoopP2CameraYawInit = 0;
+
+// SoH multiplayer: per-player Camera architecture.
+// gCoopP2CameraId is the sub-camera slot allocated for P2 via
+// Play_CreateSubCamera. -1 (SUBCAM_NONE) = not yet allocated. Allocated
+// in P2's Player_Init when co-op spawns P2; persists for the scene.
+// Cleared on scene change (engine resets all sub-cameras).
+//
+// Architecture: while P2's Player_UpdateCommon runs, play->activeCamera
+// is swapped to gCoopP2CameraId. All vanilla code that reads
+// GET_ACTIVE_CAM(play) or Play_GetCamera(play, SUBCAM_ACTIVE) returns
+// P2's camera. Camera_ChangeMode/Setting calls in vanilla code therefore
+// mutate P2's camera, not main. Restored to MAIN_CAM at exit.
+//
+// Hardcoded Play_GetCamera(play, SUBCAM_ACTIVE) / (play, MAIN_CAM) calls in player
+// source were rewritten to (play, SUBCAM_ACTIVE) so they participate in
+// this swap. Code OUTSIDE player files that use MAIN_CAM (cutscenes,
+// scene scripts, etc.) continue to read main, which is intentional —
+// those concern engine-wide state, not per-player.
+s32 gCoopP2CameraId = SUBCAM_NONE;
+
+// SoH multiplayer: P2 Navi actor pointer. Spawned by P2's Player_Update
+// on the first frame gCoopP2NaviActor == NULL; cleared on scene change.
+// EnElf_Init detects the 0x100 marker bit on params and sets
+// fairyFlags |= 0x400 so subsequent En_Elf logic routes through
+// gCoopP2TargetCtx + the P2 player actor instead of GET_PLAYER.
+Actor* gCoopP2NaviActor = NULL;
+
+// SoH multiplayer: pointer to whichever Player actor is currently
+// executing Player_UpdateCommon. Set at the top of that function and
+// cleared at the bottom (right around GameInteractor_ExecuteOnPlayerUpdate)
+// so it's only non-NULL during the synchronous hook fire. Used by
+// hook_handlers.cpp's RandomizerHookShouldRunForCurrentPlayer() to gate
+// randomizer-side OnPlayerUpdate handlers to P1 only — without it those
+// hooks run twice per frame (once per player tick) and produce duplicate
+// item-give attempts visible in the crash log.
+//
+// NOT static so the C++ hook handler can extern-declare it directly.
+Player* sCurrentlyUpdatingPlayer = NULL;
+
+// SoH multiplayer: gate for cutscene-camera-takeover calls in player
+// code. Vanilla bakes MAIN_CAM into ~6 OnePointCutscene_Init call sites
+// (crawlspace enter/exit, death, item-get, etc.). The function creates
+// a sub-camera with CAM_STAT_ACTIVE and **swaps play->activeCamera** to
+// it for the duration of the cutscene — i.e., it commandeers the global
+// rendering camera, not just a per-player view. When P2 triggers one of
+// these, the cinematic camera becomes the world's active view and P1
+// gets stuck watching P2's crawlspace top-down angle (the most visible
+// reproducer of "P1 camera locks after P2 uses a crawlspace").
+//
+// Earlier this macro returned gCoopP2CameraId so the cutscene became a
+// CHILD of P2's camera, but that doesn't help — the cutscene cam still
+// hijacks play->activeCamera globally regardless of its parent.
+//
+// Right fix: COOP_SHOULD_PLAY_PLAYER_CUTSCENE(this) → 1 for P1, 0 for
+// P2 in co-op. Call sites guard their OnePointCutscene_Init with this.
+// P1 keeps vanilla behavior. P2 simply skips the cinematic — they enter
+// or exit the crawlspace, get the death animation, etc., without the
+// camera takeover. Their PiP view continues to track them via the
+// existing per-player camera code.
+#define COOP_SHOULD_PLAY_PLAYER_CUTSCENE(thisPlayer) \
+    (PLAYER_GET_INDEX(&(thisPlayer)->actor) == 0)
+
+#define COOP_PLAYER_CUTSCENE_CAM(thisPlayer) MAIN_CAM
+
+// SoH multiplayer: first-person aim mode for P2.
+// gCoopP2InAimMode  = 1 while P2 is holding a C-button bound to a ranged
+//                     weapon (bow/slingshot). Tells z_play.c PiP renderer
+//                     to switch the P2 camera to first-person POV (eye at
+//                     P2's head, look-at projected forward along yaw +
+//                     pitch). Cleared when the C-button is released.
+// gCoopP2AimItem    = ITEM_BOW or ITEM_SLINGSHOT for projectile-type
+//                     selection during in-aim fire (B press while aiming).
+//
+// Tap C-button → auto-target one-shot (existing behavior, fires on press).
+// Hold C-button → enter aim mode, manual aim with right stick (when
+//                 FreeLook enabled), fire with B in aim direction. Release
+//                 C-button = exit aim mode.
+// Both modes coexist: a tap fires auto-target on the press frame; if held
+// past that frame, P2 stays in first-person aim and can fire manually.
+s32 gCoopP2InAimMode = 0;
+s32 gCoopP2AimItem = ITEM_NONE;
 
 // .data
 
@@ -1687,7 +1796,7 @@ void func_80832440(PlayState* play, Player* this) {
     this->unk_6AD = 0;
 
     func_80832340(play, this);
-    func_8005B1A4(Play_GetCamera(play, 0));
+    func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
 
     this->stateFlags1 &= ~(PLAYER_STATE1_HANGING_OFF_LEDGE | PLAYER_STATE1_CLIMBING_LEDGE | PLAYER_STATE1_FIRST_PERSON |
                            PLAYER_STATE1_CLIMBING_LADDER);
@@ -2065,9 +2174,80 @@ void Player_ProcessControlStick(PlayState* play, Player* this) {
     this->prevControlStickMagnitude = sControlStickMagnitude;
     this->prevControlStickAngle = sControlStickAngle;
 
-    func_80077D10(&sControlStickMagnitude, &sControlStickAngle, sControlInput);
+    // SoH multiplayer: pick the right controller input per player. The
+    // global `sControlInput` is hard-wired to Port 1 and never changes —
+    // so when this function runs during P2's Player_UpdateCommon, the
+    // stick magnitude/angle computation below was reading P1's stick.
+    // Combined with the per-player camera-yaw logic further down, this
+    // produced symptoms like "P2 walks in directions P1 is pushing" or
+    // "P2's stick doesn't move them at all when P1 is at neutral".
+    //
+    // The aim path got a similar treatment yesterday (func_8083FD78 +
+    // FP framing now read per-player input). This is the matching fix
+    // for movement direction. Same pattern: snapshot the right Input
+    // struct and pass it to func_80077D10 (the stick-to-angle helper).
+    Input coopP2StickInput;
+    const Input* coopStickSrc = sControlInput;
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        coopP2StickInput = play->state.input[1];
+        coopStickSrc = &coopP2StickInput;
+    }
+    func_80077D10(&sControlStickMagnitude, &sControlStickAngle, coopStickSrc);
 
-    sControlStickWorldYaw = Camera_GetInputDirYaw(GET_ACTIVE_CAM(play)) + sControlStickAngle;
+    // SoH multiplayer: stick-to-world direction conversion for P2.
+    //
+    // SHARED-SCREEN (PiP off): use P1's active camera direction, same as
+    // vanilla. There's only one camera and both players share its
+    // perspective. Without this, gCoopP2CameraYaw chases P2's facing
+    // each frame, creating a feedback loop with no equilibrium when stick
+    // is held in any direction — P2 ends up spinning in circles instead
+    // of doing a clean U-turn (the user's "boat-turning" / "spin in a
+    // circle on stick-down" report).
+    //
+    // SPLIT-SCREEN (PiP on): P2 has its own smoothed camera yaw
+    // (gCoopP2CameraYaw). This represents the direction P2's PiP camera
+    // is facing, which lags slightly behind P2's body and includes
+    // FreeLook right-stick contribution. Using it for stick conversion
+    // matches the on-screen camera so P2's stick "up" means "away from
+    // PiP camera" — which is what the player expects when they're
+    // looking at their own viewport.
+    //
+    // P1 path is unchanged in both modes.
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        if (Coop_PiPActiveForScene(play)) {
+            // SoH multiplayer: when P2 has a lock-on, the PiP camera
+            // doesn't use gCoopP2CameraYaw — it positions BEHIND P2
+            // along the P2→target axis, so the visual "forward" on
+            // screen is the direction toward the locked target. Using
+            // the free-look yaw here means pushing "up" on the stick
+            // moves P2 along the free-look direction, NOT toward the
+            // target — controls feel disconnected from the camera the
+            // player is looking at. Fix: when focusActor is set, derive
+            // yaw from P2→target so stick-up means "toward target",
+            // matching the PiP camera framing.
+            s16 coopMoveYaw;
+            if (this->focusActor != NULL) {
+                f32 coopFdx = this->focusActor->world.pos.x - this->actor.world.pos.x;
+                f32 coopFdz = this->focusActor->world.pos.z - this->actor.world.pos.z;
+                coopMoveYaw = Math_Atan2S(coopFdz, coopFdx);
+            } else {
+                coopMoveYaw = (s16)gCoopP2CameraYaw;
+            }
+            sControlStickWorldYaw = coopMoveYaw + sControlStickAngle;
+        } else {
+            // Shared-screen: explicitly read main camera direction. The
+            // active-camera swap during P2's update routes GET_ACTIVE_CAM
+            // to P2's sub-camera, but in shared-screen mode the player
+            // sees P1's main camera — so P2's stick must be interpreted
+            // relative to that camera, not P2's stale one. Without this
+            // fix P2's stick "up" pointed in some weird direction (using
+            // a sub-camera that hadn't been updated by the engine since
+            // it has WAIT status).
+            sControlStickWorldYaw = Camera_GetInputDirYaw(Play_GetCamera(play, MAIN_CAM)) + sControlStickAngle;
+        }
+    } else {
+        sControlStickWorldYaw = Camera_GetInputDirYaw(GET_ACTIVE_CAM(play)) + sControlStickAngle;
+    }
 
     this->controlStickDataIndex = (this->controlStickDataIndex + 1) % 4;
 
@@ -2626,12 +2806,25 @@ void Player_StartChangingHeldItem(Player* this, PlayState* play) {
 }
 
 void Player_UpdateItems(Player* this, PlayState* play) {
+    // SoH multiplayer: relax the (activeCamera == MAIN_CAM) gate to also
+    // accept P2's sub-camera. The original check is intended to block
+    // item use during cutscenes / scene transitions where activeCamera
+    // points to a cinematic sub-camera. Our per-player camera architecture
+    // legitimately swaps activeCamera to P2's camera during P2's update,
+    // and P2 is in normal gameplay just like P1 — they should be able
+    // to draw weapons, swap items, etc. Without this relaxation, ALL P2
+    // item-button presses (sword B, bow C, slingshot C, bottles, etc.)
+    // were being silently dropped because Player_ProcessItemButtons
+    // never got called for P2. Shield kept working because it's gated
+    // through a different path (Player_HandleStandingShielding).
+    s32 coopActiveCamOk = (play->activeCamera == MAIN_CAM) ||
+                          (gCoopP2CameraId != SUBCAM_NONE && play->activeCamera == gCoopP2CameraId);
     if ((this->actor.category == ACTORCAT_PLAYER) &&
         (CVarGetInteger(CVAR_ENHANCEMENT("QuickPutaway"), 0) ||
          !(this->stateFlags1 & PLAYER_STATE1_START_CHANGING_HELD_ITEM)) &&
         ((this->heldItemAction == this->itemAction) || (this->stateFlags1 & PLAYER_STATE1_SHIELDING)) &&
         (gSaveContext.health != 0) && (play->csCtx.state == CS_STATE_IDLE) && (this->csAction == 0) &&
-        (play->shootingGalleryStatus == 0) && (play->activeCamera == MAIN_CAM) &&
+        (play->shootingGalleryStatus == 0) && coopActiveCamOk &&
         (play->transitionTrigger != TRANS_TRIGGER_START) && (gSaveContext.timerState != TIMER_STATE_STOP)) {
         Player_ProcessItemButtons(this, play);
     }
@@ -2945,7 +3138,7 @@ int func_80834E7C(PlayState* play) {
 
 s32 func_80834EB8(Player* this, PlayState* play) {
     if ((this->unk_6AD == 0) || (this->unk_6AD == 2)) {
-        if (Player_IsZTargeting(this) || (Camera_CheckValidMode(Play_GetCamera(play, 0), 7) == 0)) {
+        if (Player_IsZTargeting(this) || (Camera_CheckValidMode(Play_GetCamera(play, SUBCAM_ACTIVE), 7) == 0)) {
             return 1;
         }
         this->unk_6AD = 2;
@@ -3404,13 +3597,13 @@ void func_80835E44(PlayState* play, s16 camSetting) {
             Interface_ChangeAlpha(2);
         }
     } else {
-        Camera_ChangeSetting(Play_GetCamera(play, 0), camSetting);
+        Camera_ChangeSetting(Play_GetCamera(play, SUBCAM_ACTIVE), camSetting);
     }
 }
 
 void func_80835EA4(PlayState* play, s32 arg1) {
     func_80835E44(play, CAM_SET_TURN_AROUND);
-    Camera_SetCameraData(Play_GetCamera(play, 0), 4, NULL, NULL, arg1, 0, 0);
+    Camera_SetCameraData(Play_GetCamera(play, SUBCAM_ACTIVE), 4, NULL, NULL, arg1, 0, 0);
 }
 
 void Player_DestroyHookshot(Player* this) {
@@ -3561,7 +3754,7 @@ void func_80836448(PlayState* play, Player* this, LinkAnimationHeader* anim) {
             gSaveContext.natureAmbienceId = NATURE_ID_DISABLED;
         }
 
-        OnePointCutscene_Init(play, 9806, cond ? 120 : 60, &this->actor, MAIN_CAM);
+        if (COOP_SHOULD_PLAY_PLAYER_CUTSCENE(this)) OnePointCutscene_Init(play, 9806, cond ? 120 : 60, &this->actor, MAIN_CAM);
         ShrinkWindow_SetVal(0x20);
     }
 }
@@ -3671,10 +3864,21 @@ s32 Player_SetupWaitForPutAway(PlayState* play, Player* this, AfterPutAwayFunc a
  */
 void Player_UpdateShapeYaw(Player* this, PlayState* play) {
     s16 previousYaw = this->actor.shape.rot.y;
+    // SoH multiplayer: pick the right TargetContext for the settled
+    // gate below. Without this, P2's body rotation toward its focus
+    // actor was gated on P1's targetCtx.unk_4B — meaning P2 wouldn't
+    // turn to face P2's locked target until P1 also had a settled
+    // lock-on, and would turn toward whatever P1 was locked onto.
+    extern TargetContext gCoopP2TargetCtx;
+    TargetContext* coopOwningTargetCtx =
+        (PLAYER_GET_INDEX(&this->actor) != 0 &&
+         CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0))
+            ? &gCoopP2TargetCtx
+            : &play->actorCtx.targetCtx;
 
     if (!(this->stateFlags2 & (PLAYER_STATE2_DISABLE_ROTATION_Z_TARGET | PLAYER_STATE2_DISABLE_ROTATION_ALWAYS))) {
         if ((this->focusActor != NULL) &&
-            ((play->actorCtx.targetCtx.unk_4B != 0) || (this->actor.category != ACTORCAT_PLAYER))) {
+            ((coopOwningTargetCtx->unk_4B != 0) || (this->actor.category != ACTORCAT_PLAYER))) {
             Math_ScaledStepToS(&this->actor.shape.rot.y,
                                Math_Vec3f_Yaw(&this->actor.world.pos, &this->focusActor->focus.pos), 4000);
         } else if ((this->stateFlags1 & PLAYER_STATE1_PARALLEL) &&
@@ -3784,6 +3988,62 @@ void Player_UpdateZTargeting(Player* this, PlayState* play) {
     s32 usingHoldTargeting;
     s32 isTalking;
 
+    // SoH multiplayer: P2 Z-targeting (lock-on + Parallel/recenter)
+    // is conditionally disabled to prevent leaks into MAIN_CAM that
+    // visibly break boss fights (most clearly observed in King
+    // Dodongo's lair — see commentary below). Three shared globals
+    // leak despite the activeCamera swap routing Camera_* calls into
+    // P2's sub-camera:
+    //
+    //   1. Enemy AI face-tracking. Most enemies (bosses especially)
+    //      turn toward the player who is currently locked onto them.
+    //      King Dodongo's AI uses the target priority field on its
+    //      actor (this->focusActor->targetPriority = 40 set during
+    //      lock-on engage, z_player.c) to pick which player to face.
+    //      P2 locking on → King Dodongo turns toward P2 → boss
+    //      camera (which tracks the boss's position/facing) frames
+    //      the scene from a different angle → P1's view "jumps".
+    //
+    //   2. Parallel state machine. PLAYER_STATE1_PARALLEL is per-
+    //      player, but the parallel-yaw cone used by boss/dungeon
+    //      camera modes when computing framing reads "is any player
+    //      parallel-mode active near me" via shared collision /
+    //      proximity passes.
+    //
+    //   3. zTargetActiveTimer engagement window triggers a 10-frame
+    //      PLAYER_STATE1_IN_CUTSCENE blip that the global cutscene
+    //      plumbing reads.
+    //
+    // Long-term: per-enemy AI changes (force-target-P1 in coop), or
+    // a separate boss-camera variant that ignores P2's targeting.
+    // Short-term: gate on a CVar so users choose.
+    //
+    // CVAR_ENHANCEMENT("LocalCoop.P2.AllowLockOn") — default 0:
+    //   - 0 (default, stable): P2 cannot lock on or enter Parallel.
+    //     Z presses on Port 2 are ignored by the Z-targeting code path
+    //     (camera recenter via the P2-camera update block at line
+    //     ~13127 still works). Boss fights frame normally.
+    //   - 1 (opt-in, experimental): P2's full lock-on engages,
+    //     including reticle, Parallel, target cycling. Boss fights may
+    //     have camera glitches when P2 locks on (P1's view jumps as the
+    //     boss turns toward P2). Useful for non-boss combat where the
+    //     leak doesn't manifest.
+    //
+    // Defensive: in the disabled path, also release any lingering
+    // state so toggling the CVar mid-session doesn't leave P2 stuck
+    // locked on with no way to release.
+    if (PLAYER_GET_INDEX(&this->actor) != 0 &&
+        CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0) &&
+        !CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.P2.AllowLockOn"), 1)) {
+        if (this->focusActor != NULL || (this->stateFlags1 & PLAYER_STATE1_Z_TARGETING) ||
+            (this->stateFlags1 & PLAYER_STATE1_PARALLEL)) {
+            Player_ReleaseLockOn(this);
+            this->stateFlags1 &= ~PLAYER_STATE1_PARALLEL;
+        }
+        this->zTargetActiveTimer = 0;
+        return;
+    }
+
     if (!zButtonHeld) {
         this->stateFlags1 &= ~PLAYER_STATE1_LOCK_ON_FORCED_TO_RELEASE;
     }
@@ -3833,9 +4093,30 @@ void Player_UpdateZTargeting(Player* this, PlayState* play) {
                                       CHECK_BTN_ALL(sControlInput->press.button, BTN_Z))) {
 
                 if (this->actor.category == ACTORCAT_PLAYER) {
-                    // The next lock-on actor defaults to the actor Navi is hovering over.
-                    // This may change to the arrow hover actor below.
-                    nextLockOnActor = play->actorCtx.targetCtx.arrowPointedActor;
+                    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+                        // SoH multiplayer: P2 lock-on target search.
+                        // Cached actor->xyzDistToPlayerSq /
+                        // yawTowardsPlayer are NEAREST-player relative
+                        // (Actor_UpdateAll co-op patch). For actors
+                        // closer to P1 than to P2, those fields are
+                        // P1-relative — so vanilla func_80032AF0 with
+                        // player=P2 used the wrong reference for cone/
+                        // distance filtering. Result: P2 could only
+                        // lock onto things near P1.
+                        //
+                        // Coop_FindTargetForPlayer rebuilds distance
+                        // and yaw FRESH per candidate from P2's
+                        // position and facing, with the same priority
+                        // pass structure (BOSS/ENEMY/BG first, then
+                        // less-priority categories), same range gate,
+                        // same line-of-sight check. P2's lock-on range
+                        // is now genuinely independent of P1.
+                        nextLockOnActor = Coop_FindTargetForPlayer(play, &play->actorCtx, this);
+                    } else {
+                        // The next lock-on actor defaults to the actor Navi is hovering over.
+                        // This may change to the arrow hover actor below.
+                        nextLockOnActor = play->actorCtx.targetCtx.arrowPointedActor;
+                    }
                 } else {
                     // Dark Link will always lock onto the player.
                     nextLockOnActor = &GET_PLAYER(play)->actor;
@@ -3853,7 +4134,22 @@ void Player_UpdateZTargeting(Player* this, PlayState* play) {
                     // will be the same if already locked on.
                     // In this case, `nextLockOnActor` will be the arrow hover actor instead.
                     if ((nextLockOnActor == this->focusActor) && (this->actor.category == ACTORCAT_PLAYER)) {
-                        nextLockOnActor = play->actorCtx.targetCtx.unk_94;
+                        // SoH multiplayer: read from the per-player
+                        // targetCtx.unk_94 for the cycle-to-next path.
+                        // Vanilla reads play->actorCtx.targetCtx.unk_94
+                        // (P1's). For P2 that meant P2 was cycling to
+                        // whatever P1's Navi was hovering on — and the
+                        // cross-contamination between players' lock-on
+                        // selection state was a contributor to the
+                        // "P1's lock-on logic breaks when P2 is also
+                        // locked on" symptom.
+                        extern TargetContext gCoopP2TargetCtx;
+                        TargetContext* coopCycleCtx =
+                            (PLAYER_GET_INDEX(&this->actor) != 0 &&
+                             CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0))
+                                ? &gCoopP2TargetCtx
+                                : &play->actorCtx.targetCtx;
+                        nextLockOnActor = coopCycleCtx->unk_94;
                     }
 
                     if (GameInteractor_Should(VB_TOGGLE_Z_TARGET_SWITCH_TARGETS, nextLockOnActor != this->focusActor)) {
@@ -4034,7 +4330,18 @@ s32 Player_GetMovementSpeedAndYaw(Player* this, f32* outSpeedTarget, s16* outYaw
         *outYawTarget = this->actor.shape.rot.y;
 
         if (this->focusActor != NULL) {
-            if ((play->actorCtx.targetCtx.unk_4B != 0) &&
+            // SoH multiplayer: pick per-player TargetContext. Same
+            // bug class as Player_UpdateShapeYaw — gating P2's lock-on
+            // stick yaw on P1's settled flag (targetCtx.unk_4B) was a
+            // cross-contamination point between players' lock-on
+            // state.
+            extern TargetContext gCoopP2TargetCtx;
+            TargetContext* coopMoveCtx =
+                (PLAYER_GET_INDEX(&this->actor) != 0 &&
+                 CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0))
+                    ? &gCoopP2TargetCtx
+                    : &play->actorCtx.targetCtx;
+            if ((coopMoveCtx->unk_4B != 0) &&
                 !(this->stateFlags2 & PLAYER_STATE2_DISABLE_ROTATION_ALWAYS)) {
                 *outYawTarget = Math_Vec3f_Yaw(&this->actor.world.pos, &this->focusActor->focus.pos);
                 return false;
@@ -4045,7 +4352,21 @@ s32 Player_GetMovementSpeedAndYaw(Player* this, f32* outSpeedTarget, s16* outYaw
 
         return false;
     } else {
-        *outYawTarget += Camera_GetInputDirYaw(GET_ACTIVE_CAM(play));
+        // SoH multiplayer: shared-screen P2 uses P1's main camera (since
+        // that's what's rendered to screen) — explicitly read MAIN_CAM,
+        // not GET_ACTIVE_CAM. My activeCamera swap routes GET_ACTIVE_CAM
+        // to P2's stale sub-camera during P2's update, which would feed
+        // wrong direction into stick conversion. Split-screen P2 uses
+        // its own smoothed yaw (camera P2 actually sees on right half).
+        if (PLAYER_GET_INDEX(&this->actor) != 0) {
+            if (Coop_PiPActiveForScene(play)) {
+                *outYawTarget += (s16)gCoopP2CameraYaw;
+            } else {
+                *outYawTarget += Camera_GetInputDirYaw(Play_GetCamera(play, MAIN_CAM));
+            }
+        } else {
+            *outYawTarget += Camera_GetInputDirYaw(GET_ACTIVE_CAM(play));
+        }
         return true;
     }
 }
@@ -5044,7 +5365,7 @@ void func_80838F5C(PlayState* play, Player* this) {
 
     this->stateFlags1 |= PLAYER_STATE1_IN_CUTSCENE | PLAYER_STATE1_FLOOR_DISABLED;
 
-    Camera_ChangeSetting(Play_GetCamera(play, 0), CAM_SET_FREE0);
+    Camera_ChangeSetting(Play_GetCamera(play, SUBCAM_ACTIVE), CAM_SET_FREE0);
 }
 
 s32 func_80838FB8(PlayState* play, Player* this) {
@@ -5459,7 +5780,7 @@ s32 Player_ActionHandler_1(Player* this, PlayState* play) {
                             gSaveContext.entranceSound = NA_SE_OC_DOOR_OPEN;
                         }
                     } else {
-                        Camera_ChangeDoorCam(Play_GetCamera(play, 0), doorActor,
+                        Camera_ChangeDoorCam(Play_GetCamera(play, SUBCAM_ACTIVE), doorActor,
                                              play->transiActorCtx.list[(u16)doorActor->params >> 10]
                                                  .sides[(doorDirection > 0) ? 0 : 1]
                                                  .effects,
@@ -5851,6 +6172,15 @@ void func_8083AA10(Player* this, PlayState* play) {
 s32 func_8083AD4C(PlayState* play, Player* this) {
     s32 camMode;
 
+    // SoH multiplayer: P2 now has a dedicated sub-camera (gCoopP2CameraId)
+    // and play->activeCamera is swapped to it during P2's update. The
+    // Camera_ChangeMode call at the bottom of this function targets
+    // SUBCAM_ACTIVE which resolves to P2's camera for P2 — so P2 can
+    // freely enter aim modes (BOWARROW/SLINGSHOT/HOOKSHOT/FIRSTPERSON/
+    // BOOMERANG) on their own camera without touching P1's view. The
+    // previous early-return guard for non-zero PLAYER_GET_INDEX is no
+    // longer needed.
+
     if (this->unk_6AD == 2) {
         if (func_8002DD6C(this)) {
             bool shouldUseBowCamera = LINK_IS_ADULT;
@@ -5874,7 +6204,7 @@ s32 func_8083AD4C(PlayState* play, Player* this) {
         camMode = CAM_MODE_FIRSTPERSON;
     }
 
-    return Camera_ChangeMode(Play_GetCamera(play, 0), camMode);
+    return Camera_ChangeMode(Play_GetCamera(play, SUBCAM_ACTIVE), camMode);
 }
 
 /**
@@ -5942,7 +6272,15 @@ void func_8083AF44(PlayState* play, Player* this, s32 magicSpell) {
     }
 
     if (magicSpell == 5) {
-        this->subCamId = OnePointCutscene_Init(play, 1100, -101, NULL, MAIN_CAM);
+        // For P2 in co-op, skip the cinematic entirely — see notes by
+        // COOP_SHOULD_PLAY_PLAYER_CUTSCENE. Setting subCamId to
+        // SUBCAM_NONE keeps downstream "is the sub-camera done?" checks
+        // happy without a global camera takeover.
+        if (COOP_SHOULD_PLAY_PLAYER_CUTSCENE(this)) {
+            this->subCamId = OnePointCutscene_Init(play, 1100, -101, NULL, MAIN_CAM);
+        } else {
+            this->subCamId = SUBCAM_NONE;
+        }
     } else {
         func_80835EA4(play, 10);
     }
@@ -6116,7 +6454,7 @@ s32 Player_ActionHandler_13(Player* this, PlayState* play) {
                     func_80835EA4(play, (this->unk_6A8 != NULL) ? 0x5B : 0x5A);
                     if (this->unk_6A8 != NULL) {
                         this->stateFlags2 |= PLAYER_STATE2_PLAY_FOR_ACTOR;
-                        Camera_SetParam(Play_GetCamera(play, 0), 8, this->unk_6A8);
+                        Camera_SetParam(Play_GetCamera(play, SUBCAM_ACTIVE), 8, this->unk_6A8);
                     }
                 }
             } else if (func_8083AD4C(play, this)) {
@@ -6242,7 +6580,7 @@ s32 Player_ActionHandler_Talk(Player* this, PlayState* play) {
 
 s32 func_8083B8F4(Player* this, PlayState* play) {
     if (!(this->stateFlags1 & (PLAYER_STATE1_CARRYING_ACTOR | PLAYER_STATE1_ON_HORSE)) &&
-        Camera_CheckValidMode(Play_GetCamera(play, 0), 6)) {
+        Camera_CheckValidMode(Play_GetCamera(play, SUBCAM_ACTIVE), 6)) {
         if ((this->actor.bgCheckFlags & 1) ||
             (func_808332B8(this) && (this->actor.yDistToWater < this->ageProperties->unk_2C))) {
             this->unk_6AD = 1;
@@ -7427,7 +7765,7 @@ s32 Player_ActionHandler_2(Player* this, PlayState* play) {
                         Player_AnimPlayOnceAdjusted(play, this, this->ageProperties->unk_98);
                         Player_StartAnimMovement(play, this, 0x28F);
                         chest->unk_1F4 = 1;
-                        Camera_ChangeSetting(Play_GetCamera(play, 0), CAM_SET_SLOW_CHEST_CS);
+                        Camera_ChangeSetting(Play_GetCamera(play, SUBCAM_ACTIVE), CAM_SET_SLOW_CHEST_CS);
                     } else {
                         Player_AnimPlayOnce(play, this, &gPlayerAnim_link_normal_box_kick);
                         chest->unk_1F4 = -1;
@@ -7637,6 +7975,37 @@ s32 Player_TryEnteringCrawlspace(Player* this, PlayState* play, u32 interactWall
     f32 zVertex2;
     s32 i;
 
+    // SoH multiplayer: P2 cannot enter crawlspaces. The crawl-state has
+    // significant camera-state coupling — crawl entry / exit triggers
+    // OnePoint cutscenes (csIds 9601/9602) and forces MAIN_CAM into
+    // CAM_STAT_WAIT while a cutscene sub-camera takes over. The brute-
+    // force recovery at line 12891 (sCoopP1WasCrawling falling edge)
+    // only handles P1 — it explicitly checks PLAYER_GET_INDEX == 0 and
+    // operates on MAIN_CAM. For P2 the equivalent cleanup chain never
+    // fires: P2's sub-camera doesn't go into the OnePoint flow correctly,
+    // gCoopP2CameraId gets wedged at WAIT status with no recovery, and
+    // the game appears to freeze (P2 stops moving, P1 may still be free
+    // but the rendering / input pipeline hangs).
+    //
+    // Cleanest fix: block P2 from interacting with crawlspaces at the
+    // single entry point. Returning false here means
+    //   1. No "Press A to Enter" prompt for P2 (DO_ACTION_ENTER flag
+    //      stays clear)
+    //   2. Pressing A near a crawlspace as P2 does nothing
+    //   3. The entire crawl-state machinery — including the cutscene
+    //      and the camera coupling — never engages for P2
+    // P1 path is unchanged, so P1 can crawl normally and the existing
+    // falling-edge recovery still works.
+    //
+    // The Kokiri Forest Lost Woods entrance crawlspace is the most
+    // visible repro — both players approach, P2 gets prompted to enter,
+    // any input from P2 freezes the game. This guard makes that
+    // impossible.
+    if (PLAYER_GET_INDEX(&this->actor) != 0 &&
+        CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0)) {
+        return false;
+    }
+
     if (!LINK_IS_ADULT && !(this->stateFlags1 & PLAYER_STATE1_IN_WATER) && (interactWallFlags & 0x30)) {
         if (!GameInteractor_Should(VB_CRAWL, true)) {
             return false;
@@ -7783,7 +8152,7 @@ s32 Player_TryLeavingCrawlspace(Player* this, PlayState* play) {
                     this->actor.shape.rot.y = this->actor.wallYaw + 0x8000;
                     Player_AnimPlayOnce(play, this, &gPlayerAnim_link_child_tunnel_end);
                     Player_StartAnimMovement(play, this, 0x9D);
-                    OnePointCutscene_Init(play, 9601, 999, NULL, MAIN_CAM);
+                    if (COOP_SHOULD_PLAY_PLAYER_CUTSCENE(this)) OnePointCutscene_Init(play, 9601, 999, NULL, MAIN_CAM);
                 } else {
                     // Leaving a crawlspace backwards
                     this->actor.shape.rot.y = this->actor.wallYaw;
@@ -7791,7 +8160,7 @@ s32 Player_TryLeavingCrawlspace(Player* this, PlayState* play) {
                                          Animation_GetLastFrame(&gPlayerAnim_link_child_tunnel_start), 0.0f,
                                          ANIMMODE_ONCE, 0.0f);
                     Player_StartAnimMovement(play, this, 0x9D);
-                    OnePointCutscene_Init(play, 9602, 999, NULL, MAIN_CAM);
+                    if (COOP_SHOULD_PLAY_PLAYER_CUTSCENE(this)) OnePointCutscene_Init(play, 9602, 999, NULL, MAIN_CAM);
                 }
             }
 
@@ -7955,6 +8324,24 @@ s32 func_8083FD78(Player* this, f32* arg1, s16* arg2, PlayState* play) {
             *arg2 = this->actor.shape.rot.y;
         }
 
+        // SoH multiplayer: vanilla aim code reads stick input via sControl
+        // Input, which is hardwired to Port 1 (P1's controller). When this
+        // function runs during P2's Player_UpdateCommon, the THIS pointer
+        // is P2 — but stick reads still pull P1's input, so P2's aim
+        // pitch (actor.focus.rot.x) was being driven by P1's stick. Yaw
+        // worked because it comes from movement code which IS per-player,
+        // but pitch was wrong. Fix: pick the right input pointer per
+        // player. P1 still uses sControlInput (preserves the existing
+        // Right-Stick-Aim merging behavior across both sticks). P2 uses
+        // a local Input built from play->state.input[1] — only `rel` is
+        // needed by the aim code below.
+        Input coopP2AimInput;
+        const Input* coopAimSrc = sControlInput;
+        if (PLAYER_GET_INDEX(&this->actor) != 0) {
+            coopP2AimInput = play->state.input[1];
+            coopAimSrc = &coopP2AimInput;
+        }
+
         // #region SOH [Enhancement]
         if (CVarGetInteger(CVAR_SETTING("Controls.RightStickAim"), 0) ||
             !CVarGetInteger(CVAR_SETTING("Controls.InvertZAimingYAxis"), 1)) {
@@ -7966,17 +8353,17 @@ s32 func_8083FD78(Player* this, f32* arg1, s16* arg2, PlayState* play) {
 
                 // preserves simultaneous left/right-stick aiming
                 if (CVarGetInteger(CVAR_SETTING("Controls.RightStickAim"), 0)) {
-                    if ((sControlInput->rel.stick_y + sControlInput->rel.right_stick_y) >= 0) {
-                        relStickY = (((sControlInput->rel.stick_y) > (sControlInput->rel.right_stick_y))
-                                         ? (sControlInput->rel.stick_y)
-                                         : (sControlInput->rel.right_stick_y));
+                    if ((coopAimSrc->rel.stick_y + coopAimSrc->rel.right_stick_y) >= 0) {
+                        relStickY = (((coopAimSrc->rel.stick_y) > (coopAimSrc->rel.right_stick_y))
+                                         ? (coopAimSrc->rel.stick_y)
+                                         : (coopAimSrc->rel.right_stick_y));
                     } else {
-                        relStickY = (((sControlInput->rel.stick_y) < (sControlInput->rel.right_stick_y))
-                                         ? (sControlInput->rel.stick_y)
-                                         : (sControlInput->rel.right_stick_y));
+                        relStickY = (((coopAimSrc->rel.stick_y) < (coopAimSrc->rel.right_stick_y))
+                                         ? (coopAimSrc->rel.stick_y)
+                                         : (coopAimSrc->rel.right_stick_y));
                     }
                 } else {
-                    relStickY = sControlInput->rel.stick_y;
+                    relStickY = coopAimSrc->rel.stick_y;
                 }
 
                 Math_SmoothStepToS(
@@ -7990,7 +8377,7 @@ s32 func_8083FD78(Player* this, f32* arg1, s16* arg2, PlayState* play) {
             if (this->focusActor != NULL) {
                 func_8083DB98(this, 1);
             } else {
-                Math_SmoothStepToS(&this->actor.focus.rot.x, sControlInput->rel.stick_y * 240.0f, 14, 4000, 30);
+                Math_SmoothStepToS(&this->actor.focus.rot.x, coopAimSrc->rel.stick_y * 240.0f, 14, 4000, 30);
                 func_80836AB8(this, 1);
             }
         }
@@ -8032,7 +8419,27 @@ s32 func_80840058(Player* this, f32* arg1, s16* arg2, PlayState* play) {
     func_8083DC54(this, play);
 
     if ((*arg1 != 0.0f) || (ABS(this->unk_87C) > 400)) {
-        s16 temp1 = *arg2 - (u16)Camera_GetInputDirYaw(GET_ACTIVE_CAM(play));
+        // SoH multiplayer: pick the same camera-yaw reference the player
+        // SEES on screen. For P1 (and shared-screen P2) that's the main
+        // camera. For split-screen P2, GET_ACTIVE_CAM returns P2's sub-
+        // camera struct which has WAIT status — its inputDir.y was
+        // initialized but never updated, so reading it gives stale data
+        // that no longer matches what's actually on screen in the right
+        // half (which is composed from gCoopP2CameraYaw via the PiP
+        // block in z_play.c). Using stale yaw here causes movement
+        // decisions (sidestep / strafe transitions) to fire at wrong
+        // angles for P2.
+        extern f32 gCoopP2CameraYaw;
+        s16 coopCamDirYaw;
+        if (PLAYER_GET_INDEX(&this->actor) != 0 &&
+            Coop_PiPActiveForScene(play)) {
+            coopCamDirYaw = (s16)gCoopP2CameraYaw;
+        } else if (PLAYER_GET_INDEX(&this->actor) != 0) {
+            coopCamDirYaw = Camera_GetInputDirYaw(Play_GetCamera(play, MAIN_CAM));
+        } else {
+            coopCamDirYaw = Camera_GetInputDirYaw(GET_ACTIVE_CAM(play));
+        }
+        s16 temp1 = *arg2 - (u16)coopCamDirYaw;
         u16 temp2 = (ABS(temp1) - 0x2000);
 
         if ((temp2 < 0x4000) || (this->unk_87C != 0)) {
@@ -9035,7 +9442,7 @@ void Player_Action_8084279C(Player* this, PlayState* play) {
         }
 
         this->actor.flags &= ~ACTOR_FLAG_TALK;
-        func_8005B1A4(Play_GetCamera(play, 0));
+        func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
     }
 }
 
@@ -9087,7 +9494,7 @@ s32 func_80842964(Player* this, PlayState* play) {
 }
 
 void Player_RequestQuake(PlayState* play, s32 speed, s32 y, s32 countdown) {
-    s32 quakeIndex = Quake_Add(Play_GetCamera(play, 0), 3);
+    s32 quakeIndex = Quake_Add(Play_GetCamera(play, SUBCAM_ACTIVE), 3);
 
     Quake_SetSpeed(quakeIndex, speed);
     Quake_SetQuakeValues(quakeIndex, y, 0, 0, 0);
@@ -9297,7 +9704,23 @@ void Player_Action_80843188(Player* this, PlayState* play) {
                (CVarGetInteger(CVAR_SETTING("Controls.InvertShieldAimingYAxis"), 1) ? 1 : -1);
         sp50 = sControlInput->rel.stick_x * (CVarGetInteger(CVAR_ENHANCEMENT("MirroredWorld"), 0) ? 120 : -120) *
                (CVarGetInteger(CVAR_SETTING("Controls.InvertShieldAimingXAxis"), 0) ? -1 : 1);
-        sp4E = this->actor.shape.rot.y - Camera_GetInputDirYaw(GET_ACTIVE_CAM(play));
+        // SoH multiplayer: same camera-yaw fix as func_80840058 — read
+        // the camera that P2 actually sees, not the stale sub-cam yaw.
+        // Affects shield-aim deflection direction. Without this, P2's
+        // shield reflections (mirror shield etc.) fire at wrong angles.
+        {
+            extern f32 gCoopP2CameraYaw;
+            s16 coopShieldCamYaw;
+            if (PLAYER_GET_INDEX(&this->actor) != 0 &&
+                Coop_PiPActiveForScene(play)) {
+                coopShieldCamYaw = (s16)gCoopP2CameraYaw;
+            } else if (PLAYER_GET_INDEX(&this->actor) != 0) {
+                coopShieldCamYaw = Camera_GetInputDirYaw(Play_GetCamera(play, MAIN_CAM));
+            } else {
+                coopShieldCamYaw = Camera_GetInputDirYaw(GET_ACTIVE_CAM(play));
+            }
+            sp4E = this->actor.shape.rot.y - coopShieldCamYaw;
+        }
         GameInteractor_ExecuteOnPlayerShieldControl(&sp50, &sp54);
 
         sp40 = Math_CosS(sp4E);
@@ -9529,7 +9952,7 @@ void func_80843AE8(PlayState* play, Player* this) {
         this->av2.actionVar2 = 60;
         Player_SpawnFairy(play, this, &this->actor.world.pos, &D_808545E4, FAIRY_REVIVE_DEATH);
         Player_PlaySfx(this, NA_SE_EV_FIATY_HEAL - SFX_FLAG);
-        OnePointCutscene_Init(play, 9908, 125, &this->actor, MAIN_CAM);
+        if (COOP_SHOULD_PLAY_PLAYER_CUTSCENE(this)) OnePointCutscene_Init(play, 9908, 125, &this->actor, MAIN_CAM);
     } else if (play->gameOverCtx.state == GAMEOVER_DEATH_WAIT_GROUND) {
         play->gameOverCtx.state = GAMEOVER_DEATH_DELAY_MENU;
         if (!CVarGetInteger(CVAR_ENHANCEMENT("PersistentMasks"), 0)) {
@@ -10371,9 +10794,9 @@ void Player_Action_80845CA4(Player* this, PlayState* play) {
             temp = func_80845BA0(play, this, &sp34, sp30);
 
             if ((this->av2.actionVar2 == 0) ||
-                ((temp == 0) && (this->linearVelocity == 0.0f) && (Play_GetCamera(play, 0)->unk_14C & 0x10))) {
+                ((temp == 0) && (this->linearVelocity == 0.0f) && (Play_GetCamera(play, SUBCAM_ACTIVE)->unk_14C & 0x10))) {
 
-                func_8005B1A4(Play_GetCamera(play, 0));
+                func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
                 func_80845C68(play, gSaveContext.respawn[RESPAWN_MODE_DOWN].data);
 
                 if (!Player_ActionHandler_Talk(this, play)) {
@@ -10407,7 +10830,7 @@ void Player_Action_80845EF8(Player* this, PlayState* play) {
             if (play->roomCtx.prevRoom.num >= 0) {
                 func_80097534(play, &play->roomCtx);
             }
-            func_8005B1A4(Play_GetCamera(play, 0));
+            func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
             Play_SetupRespawnPoint(play, 0, 0xDFF);
         }
         return;
@@ -10716,7 +11139,7 @@ void Player_StartMode_Grotto(PlayState* play, Player* this) {
     Player_SetupAction(play, this, Player_Action_8084F9C0, 0);
     this->stateFlags1 |= PLAYER_STATE1_IN_CUTSCENE;
     this->fallStartHeight = this->actor.world.pos.y;
-    OnePointCutscene_Init(play, 5110, 40, &this->actor, MAIN_CAM);
+    if (COOP_SHOULD_PLAY_PLAYER_CUTSCENE(this)) OnePointCutscene_Init(play, 5110, 40, &this->actor, MAIN_CAM);
 }
 
 void Player_StartMode_KnockedOver(PlayState* play, Player* this) {
@@ -10812,6 +11235,128 @@ void Player_Init(Actor* thisx, PlayState* play2) {
     s32 startMode;
     s32 respawnFlag;
     s32 respawnMode;
+
+    // SoH multiplayer: scene init runs P1's Player_Init first. Reset P2's
+    // sub-camera ID so it re-allocates when P2 spawns later in this Init.
+    // Engine resets all cameraPtrs on scene change, so the previous slot
+    // is invalid even if we still remember its index.
+    if (PLAYER_GET_INDEX(thisx) == 0) {
+        gCoopP2CameraId = SUBCAM_NONE;
+        gCoopP2CameraYawInit = 0;
+        // SoH multiplayer: clear P2 Navi pointer on scene change so
+        // Player_Update spawns a fresh one when P2 next exists.
+        gCoopP2NaviActor = NULL;
+    }
+
+    // SoH multiplayer: secondary players do skeleton/anim setup only.
+    if (PLAYER_GET_INDEX(thisx) != 0) {
+        this->ageProperties = &sAgeProperties[gSaveContext.linkAge];
+        // Copy P1's item state ONCE at spawn so P2 starts with whatever P1
+        // currently has equipped (sword, bow, slingshot, etc.). After this
+        // initial copy, P2 manages their own draw/sheath state independently
+        // — P1 sheathing won't force P2 to sheath, and vice versa. Inventory
+        // (gSaveContext) is shared, so both players draw from the same ammo
+        // and magic pools.
+        Player* coopP1 = (Player*)play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        if (coopP1 != NULL && coopP1 != this && PLAYER_GET_INDEX(&coopP1->actor) == 0) {
+            this->itemAction = coopP1->itemAction;
+            this->heldItemAction = coopP1->heldItemAction;
+            this->heldItemId = coopP1->heldItemId;
+            Player_UseItem(play, this, coopP1->heldItemId);
+        } else {
+            this->itemAction = this->heldItemAction = -1;
+            this->heldItemId = ITEM_NONE;
+            Player_UseItem(play, this, ITEM_NONE);
+        }
+        Player_SetEquipmentData(play, this);
+        Player_InitCommon(this, play, gPlayerSkelHeaders[((void)0, gSaveContext.linkAge)]);
+        this->giObjectSegment = (void*)(((uintptr_t)ZELDA_ARENA_MALLOC_DEBUG(0x3008) + 8) & ~0xF);
+        // SoH multiplayer: room = -1 marks the actor as global ("never cull
+        // by room"). Without this, the engine's room-bound actor cleanup
+        // kills P2 every time you cross an internal room boundary within a
+        // scene — most visible on the corridor between Kokiri Forest and
+        // the Deku Tree, where P2 silently disappears mid-walk. Vanilla P1
+        // Init does the same thing (line ~10863). Was a one-character bug:
+        // assigning curRoom.num instead of -1.
+        thisx->room = -1;
+        // SoH multiplayer: install a valid action callback so P2's update doesn't
+        // jump through a NULL actionFunc. Idle is safe — P2 isn't running scripted
+        // entrance cutscenes anyway (we hide P2 during cutscenes).
+        Player_SetupAction(play, this, Player_Action_Idle, 0);
+        Player_AnimPlayLoop(play, this, Player_GetIdleAnim(this));
+        // SoH multiplayer: physics state init that vanilla normally does inside
+        // sStartModeFuncs (specifically func_80838E70 sets unk_450). Without
+        // this, deltas like (world.pos - unk_450) start enormous and feed NaN
+        // into normalize/atan calls a few frames later.
+        this->unk_450 = thisx->world.pos;
+        this->unk_45C = thisx->world.pos;
+        // SoH multiplayer: secondary players don't get their own Navi. Spawning
+        // a second fairy creates a parent pointer that becomes stale during
+        // scene transitions and hangs the unload path. P2 just uses no Navi;
+        // the existing GetFairyOwner head fallback in z_en_elf.c handles this.
+        this->naviActor = NULL;
+
+        // SoH multiplayer: allocate a real Camera struct for P2 via the
+        // engine's sub-camera system. Vanilla Camera_ChangeMode /
+        // Camera_ChangeSetting / GET_ACTIVE_CAM all interact with this
+        // camera when play->activeCamera is swapped to its slot during
+        // P2's Player_UpdateCommon. Without this, P2 cannot enter aim
+        // mode for slingshot/bow/hookshot/boomerang — every aim path
+        // calls Camera_ChangeMode on the main camera, which would steal
+        // P1's view. With a dedicated camera, both players can be in
+        // aim mode simultaneously without interference.
+        //
+        // Camera_InitPlayerSettings sets player, dist, eye, at from
+        // P2's position. Setting CAM_SET_NORMAL0 establishes a default
+        // overworld follow setup; vanilla scene transitions usually
+        // override the setting per-scene, but this gives a sane baseline
+        // so the camera works immediately on spawn.
+        // SoH multiplayer: allocate a real Camera struct for P2 via the
+        // engine's sub-camera system. Vanilla Camera_ChangeMode /
+        // Camera_ChangeSetting / GET_ACTIVE_CAM all interact with this
+        // camera when play->activeCamera is swapped to its slot during
+        // P2's Player_UpdateCommon. Without this, P2 cannot enter aim
+        // mode for slingshot/bow/hookshot/boomerang — every aim path
+        // calls Camera_ChangeMode on the main camera, which would steal
+        // P1's view. With a dedicated camera, both players can be in
+        // aim mode simultaneously without interference.
+        //
+        // The camera is allocated once per scene (engine resets sub-
+        // cameras on scene change). If P2 respawns within a scene
+        // (teleport hotkey, in-place reset), we re-init player settings
+        // on the existing camera so its player pointer reflects the
+        // current P2 actor.
+        if (gCoopP2CameraId == SUBCAM_NONE) {
+            gCoopP2CameraId = Play_CreateSubCamera(play);
+        }
+        if (gCoopP2CameraId != SUBCAM_NONE) {
+            Camera* coopP2Cam = play->cameraPtrs[gCoopP2CameraId];
+            Camera_InitPlayerSettings(coopP2Cam, this);
+            Camera_ChangeSetting(coopP2Cam, CAM_SET_NORMAL0);
+            Camera_ChangeMode(coopP2Cam, CAM_MODE_NORMAL);
+            // Deliberately DO NOT promote to CAM_STAT_ACTIVE. Two active
+            // cameras both run Camera_Update each frame and both write to
+            // the SAME play->view (sub-cameras share play->view with main
+            // — see Play_CreateSubCamera). The last writer wins, so P2's
+            // camera ends up clobbering main's view-projection matrices
+            // and the screen renders garbage / black.
+            //
+            // Leaving the camera at its sub-camera default status
+            // (WAIT/UNK100) keeps Camera_Update mostly a no-op for it.
+            // The camera struct still serves its primary purpose: vanilla
+            // Camera_ChangeMode / Camera_ChangeSetting / camera-mode reads
+            // all target this struct (since play->activeCamera is swapped
+            // to gCoopP2CameraId during P2's Player_UpdateCommon), so
+            // vanilla aim / fire / boomerang paths work correctly for P2.
+            //
+            // PiP rendering computes its view geometry from gCoopP2CameraYaw/
+            // Pitch + spherical math (in z_play.c) rather than reading
+            // P2's camera->eye/at/up — those won't be updated each frame
+            // without ACTIVE status. Vanilla camera *mode* still gates
+            // the PiP behavior (third-person vs aim) via gCoopP2InAimMode.
+        }
+        return;
+    }
 
     play->shootingGalleryStatus = play->bombchuBowlingStatus = 0;
 
@@ -10933,6 +11478,35 @@ void Player_Init(Actor* thisx, PlayState* play2) {
 
     Map_SavePlayerInitialInfo(play);
     MREG(64) = 0;
+
+    // SoH multiplayer: auto-spawn P2 with a floor sanity check.
+    // Toggle via console: cvar_set gEnhancements.LocalCoop.Enabled 1
+    if (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0)) {
+        f32 sinY = Math_SinS(thisx->shape.rot.y);
+        f32 cosY = Math_CosS(thisx->shape.rot.y);
+        Vec3f spawnPos;
+        spawnPos.x = thisx->world.pos.x - sinY * 50.0f;
+        spawnPos.y = thisx->world.pos.y + 30.0f;
+        spawnPos.z = thisx->world.pos.z - cosY * 50.0f;
+
+        CollisionPoly* coopFloorPoly;
+        Vec3f coopRaycastFrom = spawnPos;
+        f32 coopFloorY = BgCheck_AnyRaycastFloor1(&play->colCtx, &coopFloorPoly, &coopRaycastFrom);
+
+        // Defensive: any non-finite or below-world result falls back to spawning
+        // P2 directly on top of P1. Without this, a NaN floorY produces a P2
+        // with NaN world.pos and crashes Actor_UpdateAll's atan2 path.
+        if (coopFloorY <= BGCHECK_Y_MIN || coopFloorY != coopFloorY) {
+            spawnPos = thisx->world.pos;
+        } else {
+            spawnPos.y = coopFloorY;
+        }
+
+        Actor_Spawn(&play->actorCtx, play, ACTOR_PLAYER,
+                    spawnPos.x, spawnPos.y, spawnPos.z,
+                    0, thisx->shape.rot.y, 0,
+                    PLAYER_PARAMS_WITH_INDEX(0x0D00, 1));
+    }
 }
 
 void Player_ApproachZeroBinang(s16* pValue) {
@@ -11531,11 +12105,11 @@ void Player_UpdateCamAndSeqModes(PlayState* play, Player* this) {
         seqMode = SEQ_MODE_DEFAULT;
 
         if (this->csAction != 0) {
-            Camera_ChangeMode(Play_GetCamera(play, 0), CAM_MODE_NORMAL);
+            Camera_ChangeMode(Play_GetCamera(play, SUBCAM_ACTIVE), CAM_MODE_NORMAL);
         } else if (!(this->stateFlags1 & PLAYER_STATE1_FIRST_PERSON)) {
             if ((this->actor.parent != NULL) && (this->stateFlags3 & PLAYER_STATE3_FLYING_WITH_HOOKSHOT)) {
                 camMode = CAM_MODE_HOOKSHOT;
-                Camera_SetParam(Play_GetCamera(play, 0), 8, this->actor.parent);
+                Camera_SetParam(Play_GetCamera(play, SUBCAM_ACTIVE), 8, this->actor.parent);
             } else if (Player_Action_8084377C == this->actionFunc) {
                 camMode = CAM_MODE_STILL;
             } else if (this->stateFlags2 & PLAYER_STATE2_GRABBING_DYNAPOLY) {
@@ -11552,7 +12126,7 @@ void Player_UpdateCamAndSeqModes(PlayState* play, Player* this) {
                 } else {
                     camMode = CAM_MODE_BATTLE;
                 }
-                Camera_SetParam(Play_GetCamera(play, 0), 8, focusActor);
+                Camera_SetParam(Play_GetCamera(play, SUBCAM_ACTIVE), 8, focusActor);
             } else if (this->stateFlags1 & PLAYER_STATE1_CHARGING_SPIN_ATTACK) {
                 camMode = CAM_MODE_CHARGE;
             } else if (this->stateFlags1 & PLAYER_STATE1_BOOMERANG_THROWN) {
@@ -11560,7 +12134,7 @@ void Player_UpdateCamAndSeqModes(PlayState* play, Player* this) {
                 if (CVarGetInteger(CVAR_ENHANCEMENT("BoomerangFirstPerson"), 0)) {
                     // Avoid camera jumps by switching  to normal cam to exit the first person camera,
                     // before following the boomerang
-                    if (Play_GetCamera(play, 0)->mode == CAM_MODE_FIRSTPERSON) {
+                    if (Play_GetCamera(play, SUBCAM_ACTIVE)->mode == CAM_MODE_FIRSTPERSON) {
                         camMode = CAM_MODE_NORMAL;
                     } else {
                         camMode = CAM_MODE_FOLLOWBOOMERANG;
@@ -11569,7 +12143,7 @@ void Player_UpdateCamAndSeqModes(PlayState* play, Player* this) {
                 } else {
                     camMode = CAM_MODE_FOLLOWBOOMERANG;
                 }
-                Camera_SetParam(Play_GetCamera(play, 0), 8, this->boomerangActor);
+                Camera_SetParam(Play_GetCamera(play, SUBCAM_ACTIVE), 8, this->boomerangActor);
             } else if (this->stateFlags1 & (PLAYER_STATE1_HANGING_OFF_LEDGE | PLAYER_STATE1_CLIMBING_LEDGE)) {
                 if (Player_FriendlyLockOnOrParallel(this)) {
                     camMode = CAM_MODE_HANGZ;
@@ -11605,7 +12179,7 @@ void Player_UpdateCamAndSeqModes(PlayState* play, Player* this) {
                 }
             }
 
-            Camera_ChangeMode(Play_GetCamera(play, 0), camMode);
+            Camera_ChangeMode(Play_GetCamera(play, SUBCAM_ACTIVE), camMode);
         } else {
             // First person mode
             seqMode = SEQ_MODE_STILL;
@@ -11854,6 +12428,146 @@ void Player_UpdateCommon(Player* this, PlayState* play, Input* input) {
     s32 pad;
 
     sControlInput = input;
+
+    // SoH multiplayer dev hotkey: L + D-pad-Down reloads the current scene.
+    if (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0) &&
+        PLAYER_GET_INDEX(&this->actor) == 0 &&
+        CHECK_BTN_ALL(play->state.input[0].cur.button, BTN_L) &&
+        CHECK_BTN_ALL(play->state.input[0].press.button, BTN_DDOWN)) {
+        Play_TriggerSceneReload(play);
+        return;
+    }
+
+    // SoH multiplayer: warp hotkeys (P1 holding L on Port 1 only).
+    //   L + D-pad-Up    -> teleport P2 to P1's current position
+    //   L + D-pad-Right -> teleport P1 to P2's current position
+    if (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0) &&
+        PLAYER_GET_INDEX(&this->actor) == 0 &&
+        CHECK_BTN_ALL(play->state.input[0].cur.button, BTN_L)) {
+        Player* coopP2 = NULL;
+        Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        for (; coopP != NULL; coopP = coopP->next) { if (coopP->category != ACTORCAT_PLAYER || PLAYER_GET_INDEX(coopP) == 0) continue;
+            if (coopP->category == ACTORCAT_PLAYER && coopP != &this->actor) {
+                coopP2 = (Player*)coopP;
+                break;
+            }
+        }
+        if (coopP2 != NULL) {
+            if (CHECK_BTN_ALL(play->state.input[0].press.button, BTN_DUP)) {
+                // Warp P2 to P1
+                coopP2->actor.world.pos = this->actor.world.pos;
+                coopP2->actor.prevPos = this->actor.world.pos;
+                coopP2->actor.home.pos = this->actor.world.pos;
+                coopP2->actor.velocity.x = coopP2->actor.velocity.y = coopP2->actor.velocity.z = 0.0f;
+                coopP2->linearVelocity = 0.0f;
+                coopP2->actor.speedXZ = 0.0f;
+                coopP2->unk_450 = this->actor.world.pos;
+                coopP2->unk_45C = this->actor.world.pos;
+            } else if (CHECK_BTN_ALL(play->state.input[0].press.button, BTN_DRIGHT)) {
+                // Warp P1 to P2
+                this->actor.world.pos = coopP2->actor.world.pos;
+                this->actor.prevPos = coopP2->actor.world.pos;
+                this->actor.home.pos = coopP2->actor.world.pos;
+                this->actor.velocity.x = this->actor.velocity.y = this->actor.velocity.z = 0.0f;
+                this->linearVelocity = 0.0f;
+                this->actor.speedXZ = 0.0f;
+                this->unk_450 = coopP2->actor.world.pos;
+                this->unk_45C = coopP2->actor.world.pos;
+            }
+        }
+    }
+
+    // SoH multiplayer: P2 self-teleport hotkey.
+    //   L + D-pad-Up on Port 2 -> P2 RESPAWNS at P1's position
+    //
+    // Why respawn instead of direct position copy: certain scene transitions
+    // (path to/from Deku Tree, owl drops, scripted teleports) leave P2's
+    // internal state in a stuck condition where the existing actor exists
+    // but isn't behaving correctly — physics frozen, animation broken, or
+    // simply invisible. Direct position teleport doesn't fix the stuck
+    // state; respawn does, by killing the old actor and creating a fresh
+    // one with full Player_Init (action callback, animation, unk_450
+    // physics state, all clean). Mirrors the same Actor_Spawn pattern as
+    // the auto-spawn at the end of P1's Init, including the floor raycast
+    // safety check.
+    //
+    // P1's teleport hotkeys (Port 1: L + D-Up / D-Right) still use direct
+    // position copy — P1 is the head of the actor list and respawning P1
+    // would have far broader engine implications.
+    if (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0) &&
+        PLAYER_GET_INDEX(&this->actor) != 0 &&
+        CHECK_BTN_ALL(play->state.input[1].cur.button, BTN_L) &&
+        CHECK_BTN_ALL(play->state.input[1].press.button, BTN_DUP)) {
+        Player* coopP1 = (Player*)play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        if (coopP1 != NULL && coopP1 != this &&
+            coopP1->actor.world.pos.x == coopP1->actor.world.pos.x &&
+            coopP1->actor.world.pos.y == coopP1->actor.world.pos.y &&
+            coopP1->actor.world.pos.z == coopP1->actor.world.pos.z) {
+            // Compute spawn position 50u behind P1 (same offset as the
+            // initial auto-spawn at scene init).
+            f32 coopSinY = Math_SinS(coopP1->actor.shape.rot.y);
+            f32 coopCosY = Math_CosS(coopP1->actor.shape.rot.y);
+            Vec3f coopSpawnPos;
+            coopSpawnPos.x = coopP1->actor.world.pos.x - coopSinY * 50.0f;
+            coopSpawnPos.y = coopP1->actor.world.pos.y + 30.0f;
+            coopSpawnPos.z = coopP1->actor.world.pos.z - coopCosY * 50.0f;
+
+            CollisionPoly* coopFloorPoly;
+            Vec3f coopRaycastFrom = coopSpawnPos;
+            f32 coopFloorY = BgCheck_AnyRaycastFloor1(&play->colCtx,
+                                                       &coopFloorPoly, &coopRaycastFrom);
+            if (coopFloorY <= BGCHECK_Y_MIN || coopFloorY != coopFloorY) {
+                coopSpawnPos = coopP1->actor.world.pos;
+            } else {
+                coopSpawnPos.y = coopFloorY;
+            }
+
+            // In-place reset of the existing P2 actor instead of Actor_Kill +
+            // Actor_Spawn. The kill/spawn approach was failing — Actor_Spawn
+            // for ACTOR_PLAYER mid-frame from another actor's update was
+            // returning a non-functional/invisible actor. ACTOR_PLAYER appears
+            // to have singleton-like restrictions when respawned outside the
+            // scene-init flow. In-place reset bypasses all of that: we keep
+            // the existing actor but reset its physics/animation/action state
+            // to match a fresh spawn.
+            this->actor.world.pos = coopSpawnPos;
+            this->actor.prevPos = coopSpawnPos;
+            this->actor.home.pos = coopSpawnPos;
+            this->actor.world.rot.x = 0;
+            this->actor.world.rot.y = coopP1->actor.shape.rot.y;
+            this->actor.world.rot.z = 0;
+            this->actor.shape.rot.x = 0;
+            this->actor.shape.rot.y = coopP1->actor.shape.rot.y;
+            this->actor.shape.rot.z = 0;
+            this->actor.velocity.x = 0.0f;
+            this->actor.velocity.y = 0.0f;
+            this->actor.velocity.z = 0.0f;
+            this->actor.gravity = -4.0f;
+            this->actor.minVelocityY = -20.0f;
+            this->actor.speedXZ = 0.0f;
+            this->linearVelocity = 0.0f;
+            this->unk_450 = coopSpawnPos;
+            this->unk_45C = coopSpawnPos;
+            // Re-install Idle action callback in case the previous state was
+            // stuck in some bad action (frozen damage flinch, etc.).
+            Player_SetupAction(play, this, Player_Action_Idle, 0);
+            Player_AnimPlayLoop(play, this, Player_GetIdleAnim(this));
+            // Clear stuck state flags. These bitmasks accumulate during play
+            // (in-water, on-ladder, locked-on, etc.) and a stuck bit can
+            // freeze the action callback dispatch.
+            this->stateFlags1 = 0;
+            this->stateFlags2 = 0;
+            this->stateFlags3 = 0;
+            return;
+        }
+    }
+    // SoH multiplayer: heldItemId sync removed entirely. Each player now has
+    // independent draw/sheath state — P1 putting away their bow doesn't
+    // force P2 to also put away their bow, and vice versa. Initial item
+    // setup happens once at P2 spawn (copying from P1) so P2 starts ready;
+    // after that they're on their own state machine. Inventory itself
+    // (gSaveContext) remains shared, so both players use the same ammo
+    // pool, magic meter, etc.
 
     if (this->unk_A86 < 0) {
         this->unk_A86++;
@@ -12272,6 +12986,680 @@ void Player_Update(Actor* thisx, PlayState* play) {
     Input sp44;
     Actor* dog;
 
+    // SoH multiplayer: when P1 exits a crawlspace, MAIN_CAM's setting
+    // gets stuck at CAM_SET_CRAWLSPACE — the engine's automatic scene-
+    // based camera-setting switching (Camera_ChangeDataIdx based on
+    // player position polygon, in z_camera.c around line 7634) isn't
+    // firing the way it does in single-player. P1 still successfully
+    // exits the crawlspace and moves around, but the camera stays
+    // pinned at the exit angle, refusing to return to the normal
+    // third-person follow.
+    //
+    // Earlier we tried skipping the crawl-exit OnePoint cutscene
+    // (csIds 9601/9602) on the theory that the cutscene's lifecycle
+    // was hanging — but the user confirmed the symptom persists even
+    // with the cutscene skipped. The actual cause is upstream: the
+    // BG-camera-zone detection inside Camera_Update isn't picking up
+    // the new "normal" zone P1 walked into.
+    //
+    // Direct fix: detect the falling edge of P1's PLAYER_STATE2_
+    // CRAWLING and explicitly force MAIN_CAM's setting back to
+    // mainCam->prevSetting (which holds whatever was active before
+    // the crawlspace was entered — NORMAL0/DUNGEON0/etc). Camera_
+    // ChangeSetting bumps the camera back into normal third-person
+    // follow on the next update.
+    //
+    // Only fires for P1 (PLAYER_GET_INDEX == 0) since P2 doesn't
+    // touch MAIN_CAM.
+    if (PLAYER_GET_INDEX(&this->actor) == 0) {
+        static s32 sCoopP1WasCrawling = 0;
+        s32 coopP1NowCrawling = (this->stateFlags2 & PLAYER_STATE2_CRAWLING) != 0;
+        if (sCoopP1WasCrawling && !coopP1NowCrawling &&
+            CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0)) {
+            // SoH multiplayer: on the falling edge of P1's crawling
+            // state, force the camera system back to a sane state.
+            //
+            // Root cause: the crawl-exit OnePoint cutscene
+            // (csId 9601/9602, from z_player.c line 8011) puts
+            // MAIN_CAM into CAM_STAT_WAIT (line 1208 of z_onepointdemo.c)
+            // and a cutscene sub-camera into CAM_STAT_ACTIVE. In single-
+            // player, the cutscene cam's internal mode function (Camera_
+            // Demo3 for CAM_SET_CS_3 setting) terminates itself via
+            // various keyframe conditions, then Camera_Finish (called
+            // from Play_Draw, line 1771) cleans it up and promotes
+            // MAIN_CAM back to ACTIVE.
+            //
+            // In our co-op build, that cleanup chain doesn't complete
+            // — Camera_Update / Camera_Finish run on the active cam
+            // and rely on parent/child pointer state that the per-
+            // player camera architecture (P2's sub-cam sitting in
+            // cameraPtrs[gCoopP2CameraId]) appears to perturb. The
+            // visible symptom: MAIN_CAM stays at CAM_STAT_WAIT after
+            // the crawl is over, so Camera_Update line 7645 returns
+            // early without ever updating MAIN_CAM's eye/at, and the
+            // camera looks frozen at the crawlspace exit angle even
+            // though P1 is up and walking around.
+            //
+            // Brute-force fix: on the falling edge, manually
+            //   (1) Play_ClearCamera every sub-camera EXCEPT P2's
+            //       (those are leftover cutscene/OnePoint cams from
+            //       the crawl exit that vanilla cleanup didn't reach)
+            //   (2) Promote MAIN_CAM back to CAM_STAT_ACTIVE so its
+            //       Camera_Update runs normally next frame
+            //   (3) Reset MAIN_CAM's setting to prevSetting (the pre-
+            //       crawl value, typically NORMAL0/DUNGEON0/...) — or
+            //       NORMAL0 as a safe fallback if prevSetting is bad
+            //   (4) Clear PLAYER_STATE1_IN_CUTSCENE on P1 (normally
+            //       cleared in Camera_Finish at line 7872 — re-cleared
+            //       here in case we bypassed that)
+            Camera* coopMain = play->cameraPtrs[MAIN_CAM];
+            if (coopMain != NULL) {
+                for (s16 coopI = SUBCAM_FIRST; coopI < NUM_CAMS; coopI++) {
+                    if (coopI == gCoopP2CameraId) continue;
+                    if (play->cameraPtrs[coopI] != NULL) {
+                        Play_ClearCamera(play, coopI);
+                    }
+                }
+                Play_ChangeCameraStatus(play, MAIN_CAM, CAM_STAT_ACTIVE);
+                s16 coopRestoreSetting = coopMain->prevSetting;
+                if (coopRestoreSetting == CAM_SET_NONE ||
+                    coopRestoreSetting == CAM_SET_CRAWLSPACE) {
+                    coopRestoreSetting = CAM_SET_NORMAL0;
+                }
+                Camera_ChangeSetting(coopMain, coopRestoreSetting);
+                Camera_ChangeMode(coopMain, CAM_MODE_NORMAL);
+                this->stateFlags1 &= ~PLAYER_STATE1_IN_CUTSCENE;
+                this->actor.freezeTimer = 0;
+                // SoH multiplayer: also reset the ShrinkWindow letterbox
+                // state. The Kokiri Sword chest cutscene (and other item-
+                // get / boss-intro OnePoint cutscenes triggered near the
+                // crawl exit) call ShrinkWindow_SetVal(0x20) to draw
+                // cinematic black bars. Normally these are reset to 0
+                // when the cutscene finishes via the same camera-finish
+                // chain that promotes MAIN_CAM back to ACTIVE — but that
+                // chain is what we're brute-forcing past here, so the
+                // letterbox state was being left wherever the cutscene
+                // left it. Visible symptom: game keeps running after the
+                // sword chest cutscene, but the viewport stays clamped
+                // at the cinematic letterbox dimensions (HUD draws full
+                // screen, but the 3D scene renders to a small centered
+                // box). ShrinkWindow_SetVal sets the lerp target,
+                // ShrinkWindow_SetCurrentVal sets the displayed value —
+                // setting both to 0 forces the letterbox open immediately
+                // with no transition lerp.
+                ShrinkWindow_SetVal(0);
+                ShrinkWindow_SetCurrentVal(0);
+            }
+        }
+        sCoopP1WasCrawling = coopP1NowCrawling;
+    }
+
+    // SoH multiplayer: P2 lockon disengage on Port 2 Z release.
+    // P2 has no other way to manually release a lockon — vanilla
+    // Player_UpdateZTargeting reads from sControlInput (per-player)
+    // for the Z press to ENGAGE lockon, but the RELEASE path is gated
+    // on zTargetSetting and various state flags that don't track
+    // per-player input cleanly. Easiest fix: detect Port 2 Z falling
+    // edge (held last frame, not held this frame) and call
+    // Player_ReleaseLockOn directly. Tap-to-toggle: press Z to lock,
+    // release Z to unlock. Works regardless of zTargetSetting because
+    // we are bypassing it entirely for P2.
+    if (PLAYER_GET_INDEX(&this->actor) != 0 &&
+        CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0)) {
+        static u32 sCoopP2PrevZHeld = 0;
+        u32 coopP2ZHeld = CHECK_BTN_ALL(play->state.input[1].cur.button, BTN_Z);
+        if (sCoopP2PrevZHeld && !coopP2ZHeld && this->focusActor != NULL) {
+            Player_ReleaseLockOn(this);
+        }
+        sCoopP2PrevZHeld = coopP2ZHeld;
+    }
+
+    // SoH multiplayer: smoothed P2 camera yaw + recenter handling.
+    // gCoopP2CameraYaw lerps toward P2's actual facing each frame. Used by
+    // stick-to-world conversion (Player_ProcessControlStick), the split-screen
+    // PiP camera (z_play.c), and re-centered when P2 holds L on Port 2 (so
+    // long as P1 isn't currently Z-target locked onto something — L is also
+    // P1's Z-target button, so we don't want to interfere).
+    //
+    // Wrap-aware lerp: subtracting two s16 yaw values and casting back to s16
+    // gives the shortest signed distance around the unit circle, so this
+    // handles 0-degree wrap automatically.
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        if (!gCoopP2CameraYawInit) {
+            gCoopP2CameraYaw = (f32)this->actor.shape.rot.y;
+            gCoopP2CameraPitch = 0.0f;
+            gCoopP2CameraYawInit = 1;
+        }
+        if (CHECK_BTN_ALL(play->state.input[1].cur.button, BTN_Z) &&
+            play->actorCtx.targetCtx.targetedActor == NULL) {
+            // SoH multiplayer: P2 camera-recenter trigger. Matches vanilla
+            // P1 behavior — Z-target button with no target in range snaps
+            // the camera back behind the player. Was BTN_L previously,
+            // which was functional but confusing (vanilla uses Z, not L).
+            // Recenter: snap yaw immediately to P2's current facing,
+            // reset pitch to neutral.
+            gCoopP2CameraYaw = (f32)this->actor.shape.rot.y;
+            gCoopP2CameraPitch = 0.0f;
+        } else {
+            // SoH multiplayer: vanilla-like delayed auto-recenter.
+            // Previous behavior was a 10%/frame lerp toward P2's facing
+            // every frame — that made the camera ALWAYS sit behind P2
+            // (functional, but unlike vanilla P1 which lets you look
+            // around for a few seconds before snapping back).
+            //
+            // New behavior tracks "frames since manual input" via a
+            // static counter. Manual input = either stick beyond the
+            // small deadzone, or P2 moving (left stick non-neutral).
+            // Below the threshold the counter increments; the recenter
+            // lerp only kicks in after the counter exceeds ~90 frames
+            // (~1.5s @60fps). Once active the lerp is 3% per frame —
+            // slow enough to feel like a gentle slide back rather than
+            // a snap, matching vanilla camera recenter feel.
+            static s32 sCoopP2RecenterTimer = 0;
+            s32 coopRsX2 = play->state.input[1].cur.right_stick_x;
+            s32 coopRsY2 = play->state.input[1].cur.right_stick_y;
+            s32 coopLsX2 = play->state.input[1].cur.stick_x;
+            s32 coopLsY2 = play->state.input[1].cur.stick_y;
+            int coopManualCam = (ABS(coopRsX2) >= 12) || (ABS(coopRsY2) >= 12);
+            int coopMoving    = (ABS(coopLsX2) >= 20) || (ABS(coopLsY2) >= 20);
+            if (coopManualCam || coopMoving) {
+                // Active input — keep camera where the player has it,
+                // reset the dwell counter.
+                sCoopP2RecenterTimer = 0;
+            } else {
+                if (sCoopP2RecenterTimer < 0x7FFF) sCoopP2RecenterTimer++;
+                if (sCoopP2RecenterTimer >= 90) {
+                    s16 coopTargetYaw = this->actor.shape.rot.y;
+                    s16 coopCurrentYaw = (s16)gCoopP2CameraYaw;
+                    s16 coopYawDiff = coopTargetYaw - coopCurrentYaw;
+                    gCoopP2CameraYaw += (f32)coopYawDiff * 0.03f;
+                }
+            }
+
+            // Right-stick free-look input from Port 2. Mirrors the FreeLook
+            // enhancement used for P1's main camera, but reads Port 2's
+            // right stick and applies to P2's camera yaw/pitch state. Only
+            // active when both:
+            //   - The FreeLook enhancement CVar is enabled (vanilla otherwise)
+            //   - Split-screen mode is on (PiPPrototype CVar) — in shared-
+            //     screen mode there's only one camera and P2's right stick
+            //     should not rotate it (that would also drift P2's stick-
+            //     to-world reference, making P2's controls feel weird).
+            //
+            // Sensitivity CVars are shared between P1 and P2 (one global
+            // setting). Same sensitivity multipliers as Camera_Free.
+            // Pitch is clamped to the same vanilla range to prevent the
+            // camera from going under the floor or all the way overhead.
+            // SoH multiplayer: P2 free-look has its own toggle. The default
+            // value follows P1's "FreeLook.Enabled" setting — so users who
+            // already have free-look on for P1 see no change in behavior
+            // until they explicitly flip P2's toggle in the Local Co-op
+            // menu page. This lets the user disable P2's right-stick
+            // camera control independently (e.g., for younger players who
+            // find the dual-stick control overwhelming) without losing
+            // P1's free-look. CVar lives under the LocalCoop enhancement
+            // namespace so it gets reset along with the rest of coop state
+            // if the user disables coop entirely.
+            s32 coopP2FreeLookEnabled =
+                CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.P2.FreeLook"),
+                               CVarGetInteger(CVAR_SETTING("FreeLook.Enabled"), 0));
+            if (coopP2FreeLookEnabled &&
+                Coop_PiPActiveForScene(play)) {
+                s32 coopRawRsX = play->state.input[1].cur.right_stick_x;
+                s32 coopRawRsY = play->state.input[1].cur.right_stick_y;
+                // Deadzone: small non-zero stick values from controller
+                // drift were accumulating in pitch over time, leaving P2's
+                // camera stuck at extreme angles (e.g., overhead top-down)
+                // until the user manually pushed the stick the other way.
+                // Ignore values inside the deadzone so a centered stick
+                // means zero camera input.
+                f32 coopRsX = (ABS(coopRawRsX) < 12) ? 0.0f : (-(f32)coopRawRsX * 10.0f);
+                f32 coopRsY = (ABS(coopRawRsY) < 12) ? 0.0f : (+(f32)coopRawRsY * 10.0f);
+                coopRsX *= CVarGetFloat(CVAR_SETTING("FreeLook.CameraSensitivity.X"), 1.0f);
+                coopRsY *= CVarGetFloat(CVAR_SETTING("FreeLook.CameraSensitivity.Y"), 1.0f);
+                s32 coopInvertX = CVarGetInteger(CVAR_SETTING("FreeLook.InvertXAxis"), 0);
+                s32 coopInvertY = CVarGetInteger(CVAR_SETTING("FreeLook.InvertYAxis"), 1);
+                gCoopP2CameraYaw += coopRsX * (coopInvertX ? -1 : 1);
+                gCoopP2CameraPitch += coopRsY * (coopInvertY ? 1 : -1);
+                // Auto-level pitch when stick is centered: gradual decay
+                // toward 0 so the camera settles back to horizontal rather
+                // than staying frozen at whatever angle the user last set.
+                // 5% per frame ≈ ~1 second to half-recover. Yaw is NOT
+                // decayed — yaw represents which way the camera faces
+                // relative to the world, not relative to the player, and
+                // resetting yaw would constantly snap the camera back to
+                // a world direction independent of where P2 is facing.
+                if (coopRsY == 0.0f) {
+                    gCoopP2CameraPitch *= 0.95f;
+                }
+                // Clamp pitch to the same range Camera_Free uses
+                // (~0x32A4 above, ~-0x228C below — allowing slight overhead
+                // tilt and a steeper down-tilt).
+                if (gCoopP2CameraPitch > 12964.0f) gCoopP2CameraPitch = 12964.0f;
+                if (gCoopP2CameraPitch < -8844.0f) gCoopP2CameraPitch = -8844.0f;
+            } else {
+                // Without FreeLook (or in shared-screen), pitch decays
+                // toward neutral so camera settles back to a level
+                // position when input stops.
+                gCoopP2CameraPitch *= 0.9f;
+            }
+        }
+        // (Previous v22 FP-pitch override removed: vanilla aim now
+        // drives actor.focus.rot.x correctly for P2 because the aim
+        // function reads per-player input, so the PiP FP framing in
+        // z_play.c reads that field directly instead of duplicating
+        // the stick-to-pitch conversion. Keeping the third-person
+        // pitch in gCoopP2CameraPitch separate avoids cross-talk when
+        // the player exits FP — third-person pitch is right-stick
+        // driven via the free-look block above; FP pitch is left-stick
+        // driven via vanilla aim. Each lives in its own field.)
+
+        // SoH multiplayer: P2 ranged weapon auto-target firing.
+        // When P2 presses the C-button that has a ranged weapon bound to it
+        // (gSaveContext.equips.buttonItems[1..3] for C-Left/C-Down/C-Right),
+        // fire a projectile toward the nearest hostile enemy. This makes P2's
+        // ranged-weapon use behave exactly like P1's: press the same button,
+        // get the same fire effect — except auto-targeted because P2 doesn't
+        // have access to first-person aim mode.
+        //
+        // Vanilla code path for non-ranged items (bombs, deku nuts, fishing
+        // rod, etc.) still runs normally on the same press. Hookshot and
+        // boomerang remain non-functional for P2 because they require aim
+        // mode — that's a known gap, will be addressed when per-player aim
+        // camera is built.
+        //
+        // Design constraints to keep P1 unaffected:
+        //   - No menu interaction (gSaveContext.equips is read-only here)
+        //   - No camera mode change (P1's camera stays in whatever mode it
+        //     was)
+        //   - No targetCtx writes (P1's Z-target state is untouched)
+        //   - No ammo decrement (the shared ammo pool is preserved for P1;
+        //     P2 effectively has unlimited ammo)
+        //   - Cooldown prevents projectile spam from button-mashing
+        {
+            static s32 sCoopP2RangedCooldown = 0;
+            if (sCoopP2RangedCooldown > 0) sCoopP2RangedCooldown--;
+            s32 coopFiredItem = ITEM_NONE;
+            s32 coopFiredButton = 0;  // which button bit to clear after firing
+            if (sCoopP2RangedCooldown == 0) {
+                u32 coopP2Press = play->state.input[1].press.button;
+                // Walk slots 1..3 (C-Left, C-Down, C-Right). Slot 0 is BTN_B
+                // which we handle separately below.
+                static const u16 coopCButtons[3] = { BTN_CLEFT, BTN_CDOWN, BTN_CRIGHT };
+                s32 coopSlot;
+                for (coopSlot = 0; coopSlot < 3; coopSlot++) {
+                    if (!(coopP2Press & coopCButtons[coopSlot])) continue;
+                    s32 coopBoundItem = gSaveContext.equips.buttonItems[coopSlot + 1];
+                    if (coopBoundItem == ITEM_BOW || coopBoundItem == ITEM_SLINGSHOT) {
+                        coopFiredItem = coopBoundItem;
+                        coopFiredButton = coopCButtons[coopSlot];
+                        break;
+                    }
+                }
+                // Also fire on B press if P2 currently has a ranged weapon
+                // drawn. This matches what users expect from vanilla — when
+                // slingshot/bow is in hand, B fires it. Vanilla normally
+                // requires being in aim mode to fire on B press; since P2
+                // can't enter aim mode (camera is shared with P1), we
+                // intercept B and fire directly here.
+                if (coopFiredItem == ITEM_NONE && (coopP2Press & BTN_B)) {
+                    if (this->heldItemAction == PLAYER_IA_SLINGSHOT) {
+                        coopFiredItem = ITEM_SLINGSHOT;
+                        coopFiredButton = BTN_B;
+                    } else if (this->heldItemAction >= PLAYER_IA_BOW &&
+                               this->heldItemAction <= PLAYER_IA_BOW_0E) {
+                        coopFiredItem = ITEM_BOW;
+                        coopFiredButton = BTN_B;
+                    }
+                }
+            }
+            if (coopFiredItem != ITEM_NONE) {
+                s32 coopArrowType;
+                if (coopFiredItem == ITEM_SLINGSHOT) {
+                    coopArrowType = ARROW_SEED;
+                } else {
+                    coopArrowType = ARROW_NORMAL;
+                }
+                // SoH multiplayer: aim P2's projectile at P2's actual
+                // lockon target (this->focusActor) when one exists.
+                // Previously we ran a LOCAL nearest-enemy search and
+                // used the result — but that search picks the nearest
+                // ACTORCAT_ENEMY to P2 regardless of whether P2 had
+                // locked onto a different enemy. Symptom: P2 locks on
+                // to Enemy A (further away) via Z, fires, but the
+                // projectile flies at Enemy B (closer to P2) — looks
+                // like "P2's shots follow P1's lockon" because Enemy B
+                // is frequently what P1 is locked onto (P1 and P2 tend
+                // to be near each other so they share nearby enemies).
+                //
+                // Right behavior: P2's lockon (via vanilla func_80032AF0
+                // call in Player_UpdateZTargeting, stored in
+                // this->focusActor) is the authoritative target. Use
+                // its position for fire yaw. Fall back to body-facing
+                // yaw if focusActor is NULL (free aim — shoot forward
+                // along P2's facing direction).
+                Actor* coopBestTarget = this->focusActor;
+                s16 coopFireYaw;
+                if (coopBestTarget != NULL) {
+                    coopFireYaw = Math_Vec3f_Yaw(&this->actor.world.pos, &coopBestTarget->world.pos);
+                } else {
+                    coopFireYaw = this->actor.shape.rot.y;
+                }
+                Actor_Spawn(&play->actorCtx, play, ACTOR_EN_ARROW,
+                            this->actor.world.pos.x,
+                            this->actor.world.pos.y + 60.0f,
+                            this->actor.world.pos.z,
+                            0, coopFireYaw, 0, coopArrowType);
+                sCoopP2RangedCooldown = 20;
+                Player_PlaySfx(this, (coopArrowType == ARROW_SEED)
+                                          ? NA_SE_IT_SLING_SHOT
+                                          : NA_SE_IT_ARROW_SHOT);
+                // Suppress the input press bit so vanilla's downstream
+                // item-use logic doesn't ALSO try to handle this button —
+                // its fire path requires aim mode which P2 can't enter,
+                // and the failure produces an "empty" / error sound. We
+                // only clear the press edge (cur.button stays so vanilla
+                // still sees the held button for aim-mode hold detection
+                // and other logic that observes held state).
+                if (coopFiredButton != 0) {
+                    play->state.input[1].press.button &= ~coopFiredButton;
+                }
+            }
+        }
+
+        // SoH multiplayer: P2 first-person aim mode.
+        // While P2 HOLDS the C-button bound to a ranged weapon, enter
+        // first-person aim mode. The PiP camera switches to first-person POV
+        // (read by z_play.c from gCoopP2InAimMode + gCoopP2CameraYaw/Pitch).
+        // Right-stick adjusts aim (when FreeLook on) — same controls as
+        // third-person follow, just now controlling aim direction.
+        // Pressing B while aiming fires a projectile in the aim direction.
+        // Releasing the C-button exits aim mode and returns to third-person.
+        //
+        // This co-exists with the auto-target press-fire above: a quick tap
+        // = one-shot auto-target. A held press = aim mode after the
+        // initial auto-target frame. Both behaviors at the user's discretion.
+        //
+        // Why not run vanilla aim mode for P2 (i.e. CAM_MODE_BOWARROW): the
+        // engine's aim mode mutates the main camera struct, which would
+        // break P1's view since they share that camera. Instead we run our
+        // own aim state machine that controls the PiP camera only —
+        // completely isolated from P1.
+        {
+            u32 coopAimCur = play->state.input[1].cur.button;
+            static const u16 coopAimCButtons[3] = { BTN_CLEFT, BTN_CDOWN, BTN_CRIGHT };
+            s32 coopAimingThisFrame = 0;
+            s32 coopAimItem = ITEM_NONE;
+            for (s32 coopAimSlot = 0; coopAimSlot < 3; coopAimSlot++) {
+                if (!(coopAimCur & coopAimCButtons[coopAimSlot])) continue;
+                s32 coopAimBound = gSaveContext.equips.buttonItems[coopAimSlot + 1];
+                if (coopAimBound == ITEM_BOW || coopAimBound == ITEM_SLINGSHOT) {
+                    coopAimingThisFrame = 1;
+                    coopAimItem = coopAimBound;
+                    break;
+                }
+            }
+            gCoopP2InAimMode = coopAimingThisFrame;
+            gCoopP2AimItem = coopAimItem;
+
+            // In-aim fire: B press while in aim mode shoots in the aim
+            // direction (yaw + pitch). Independent cooldown from the
+            // auto-target one. No ammo decrement (same policy as
+            // auto-target — P2 has effectively unlimited shots, P1's
+            // ammo pool is preserved).
+            if (gCoopP2InAimMode) {
+                static s32 sCoopP2AimFireCooldown = 0;
+                if (sCoopP2AimFireCooldown > 0) sCoopP2AimFireCooldown--;
+                if (CHECK_BTN_ALL(play->state.input[1].press.button, BTN_B) &&
+                    sCoopP2AimFireCooldown == 0) {
+                    s32 coopAimArrowType =
+                        (gCoopP2AimItem == ITEM_SLINGSHOT) ? ARROW_SEED : ARROW_NORMAL;
+                    s16 coopAimFireYaw = (s16)gCoopP2CameraYaw;
+                    // Arrow rx (pitch) convention: positive = down. Our
+                    // gCoopP2CameraPitch positive = camera looking up
+                    // (matches FreeLook's right-stick-up = look-up). So we
+                    // negate when handing to the arrow's pitch param.
+                    s16 coopAimFirePitch = -(s16)gCoopP2CameraPitch;
+                    Actor_Spawn(&play->actorCtx, play, ACTOR_EN_ARROW,
+                                this->actor.world.pos.x,
+                                this->actor.world.pos.y + 60.0f,
+                                this->actor.world.pos.z,
+                                coopAimFirePitch, coopAimFireYaw, 0, coopAimArrowType);
+                    sCoopP2AimFireCooldown = 20;
+                    Player_PlaySfx(this, (coopAimArrowType == ARROW_SEED)
+                                              ? NA_SE_IT_SLING_SHOT
+                                              : NA_SE_IT_ARROW_SHOT);
+                }
+            }
+        }
+    }
+
+    // SoH multiplayer: room-transition auto-snap. When P1 walks through a
+    // door into a new room within the same scene, P2 needs to follow or
+    // they're left behind in the old room. Static prev-room tracker detects
+    // the change between frames; on change we copy P1's position to P2.
+    // Locked-door transitions (small-key, boss-key) hit this same code path,
+    // so this also fixes the "P2 stuck behind locked door" case.
+    //
+    // Scene-change detection: when sceneNum changes (full scene transition),
+    // we update the tracker WITHOUT snapping — both P1 and P2 are getting
+    // freshly spawned by the engine via Player_Init's auto-spawn block, so
+    // a snap would fight with that initialization.
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        static s32 sCoopLastRoomNum = -1;
+        static s32 sCoopLastSceneNum = -1;
+        // SoH multiplayer: find the actual P1 by index, not by head.
+        // The actor list is LIFO and P2 was spawned LAST (via the auto-
+        // spawn hotkey), so head is P2 — which is `this`. Iterating
+        // until PLAYER_GET_INDEX == 0 finds the real P1. Without this
+        // fix the room/door snap code reads P2's own door/position
+        // fields, so the snap is a no-op (coopP1 == this fails the
+        // != this guard) — P2 then never gets warped through doors
+        // or across room boundaries.
+        Player* coopP1 = NULL;
+        {
+            Actor* coopIt = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+            for (; coopIt != NULL; coopIt = coopIt->next) {
+                if (coopIt->category == ACTORCAT_PLAYER &&
+                    PLAYER_GET_INDEX(coopIt) == 0) {
+                    coopP1 = (Player*)coopIt;
+                    break;
+                }
+            }
+        }
+        if (sCoopLastSceneNum != play->sceneNum) {
+            sCoopLastSceneNum = play->sceneNum;
+            sCoopLastRoomNum = play->roomCtx.curRoom.num;
+        } else if (sCoopLastRoomNum != play->roomCtx.curRoom.num) {
+            if (coopP1 != NULL && coopP1 != this &&
+                coopP1->actor.world.pos.x == coopP1->actor.world.pos.x &&
+                coopP1->actor.world.pos.y == coopP1->actor.world.pos.y &&
+                coopP1->actor.world.pos.z == coopP1->actor.world.pos.z) {
+                this->actor.world.pos = coopP1->actor.world.pos;
+                this->actor.prevPos = coopP1->actor.world.pos;
+                this->actor.home.pos = coopP1->actor.world.pos;
+                this->actor.velocity.x = 0.0f;
+                this->actor.velocity.y = 0.0f;
+                this->actor.velocity.z = 0.0f;
+                this->linearVelocity = 0.0f;
+                this->actor.speedXZ = 0.0f;
+                this->unk_450 = coopP1->actor.world.pos;
+                this->unk_45C = coopP1->actor.world.pos;
+            }
+            sCoopLastRoomNum = play->roomCtx.curRoom.num;
+        }
+
+        // SoH multiplayer: door rising-edge AND falling-edge snap.
+        //
+        // RISING EDGE: when P1 starts a door interaction (kneel + push
+        // animation), this->doorActor becomes non-NULL. Snap P2 to P1
+        // at the moment of transition (NULL -> non-NULL) so P2 is
+        // teleported into the doorway alongside P1 before the room
+        // transition fires.
+        //
+        // FALLING EDGE: when the door animation completes, doorActor
+        // returns to NULL. For room-internal doors that DON'T trigger
+        // a room transition (no fade, just walk-through), P1 ends up
+        // on the other side but P2 was snapped to the OLD side at the
+        // rising edge — so we need to also snap on the falling edge
+        // to put P2 next to P1's new position. The room-transition
+        // snap above handles doors that DO change rooms, so this
+        // duplicate-snap is harmless there (both spots write the
+        // same position). The double-snap correctly handles every
+        // door pattern: scene transition, room transition, and pure
+        // in-room walk-through.
+        //
+        // Static tracker is per-frame for rising/falling edge logic.
+        static Actor* sCoopLastP1DoorActor = NULL;
+        Actor* coopP1Door = (coopP1 != NULL && coopP1 != this) ? coopP1->doorActor : NULL;
+        s32 coopShouldDoorSnap =
+            (sCoopLastP1DoorActor == NULL && coopP1Door != NULL) || // rising
+            (sCoopLastP1DoorActor != NULL && coopP1Door == NULL);   // falling
+        if (coopShouldDoorSnap && coopP1 != NULL && coopP1 != this &&
+            coopP1->actor.world.pos.x == coopP1->actor.world.pos.x &&
+            coopP1->actor.world.pos.y == coopP1->actor.world.pos.y &&
+            coopP1->actor.world.pos.z == coopP1->actor.world.pos.z) {
+            this->actor.world.pos = coopP1->actor.world.pos;
+            this->actor.prevPos = coopP1->actor.world.pos;
+            this->actor.home.pos = coopP1->actor.world.pos;
+            this->actor.velocity.x = 0.0f;
+            this->actor.velocity.y = 0.0f;
+            this->actor.velocity.z = 0.0f;
+            this->linearVelocity = 0.0f;
+            this->actor.speedXZ = 0.0f;
+            this->unk_450 = coopP1->actor.world.pos;
+            this->unk_45C = coopP1->actor.world.pos;
+        }
+        sCoopLastP1DoorActor = coopP1Door;
+    }
+
+    // SoH multiplayer: secondary players hide and freeze during any cutscene,
+    // dialog, item-get, gameover, pause, scene transition, OR while P1 is in
+    // a first-person aim camera mode (bow, slingshot, hookshot, Navi look-up).
+    // The first-person modes are added because:
+    //   - The Gohma fight requires looking up at the ceiling to trigger;
+    //     P2 wandering around can break the trigger zone or interfere with
+    //     P1's aim animation.
+    //   - Vanilla expects single-player first-person aim with no other
+    //     players in the world. Treating it as a cinematic for P2 makes
+    //     ranged-weapon use feel correct.
+    // P1 still runs as normal. transitionTrigger fires when a fade starts;
+    // transitionMode is non-zero while the fade is rendering — both must be
+    // checked to fully hide P2 across the entire transition window.
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        Camera* coopMainCam = Play_GetCamera(play, SUBCAM_ACTIVE);
+        s32 coopP1FirstPerson = (coopMainCam != NULL) &&
+            (coopMainCam->mode == CAM_MODE_FIRSTPERSON ||
+             coopMainCam->mode == CAM_MODE_BOWARROW ||
+             coopMainCam->mode == CAM_MODE_SLINGSHOT ||
+             coopMainCam->mode == CAM_MODE_HOOKSHOT);
+        // SoH multiplayer: also hide P2 while P1 is going through a
+        // door or a crawlspace. Vanilla door/crawl logic moves the
+        // player through a scripted path that wasn't designed with a
+        // second player in the world — P2 ends up colliding with the
+        // door frame, getting trapped in the crawlspace alongside P1
+        // (visible in the screenshots / videos), or stuck on the other
+        // side after the transition. Per user direction ("the other
+        // player should just not exist"), we hide P2 entirely whenever
+        // P1 is in these scripted-transition states.
+        //
+        // PLAYER_STATE1_IN_CUTSCENE is set during door open/walk-through,
+        // grabbing dynapoly chests/ladders, sit-on-throne, getting
+        // items, several other scripted transitions.
+        // PLAYER_STATE2_CRAWLING is exclusively the crawlspace traverse
+        // animation.
+        // PLAYER_STATE1_DEAD covers the death cutscene.
+        Player* coopP1 = GET_PLAYER(play);
+        s32 coopP1InTransition = (coopP1 != NULL) &&
+            ((coopP1->stateFlags1 & (PLAYER_STATE1_IN_CUTSCENE | PLAYER_STATE1_DEAD)) ||
+             (coopP1->stateFlags2 & PLAYER_STATE2_CRAWLING));
+        // SoH multiplayer: ocarina states want P2 VISIBLE in P1's shared
+        // full-screen view, not hidden. The PiP gate in z_play.c also
+        // detects ocarina mode and disables split-screen, so during
+        // ocarina playback both players occupy a single shared view —
+        // which is what the ocarina UI was designed for (full screen
+        // note display) and what the user explicitly asked for. Range
+        // 0x09..0x25 covers OCARINA_STARTING through SCARECROW_RECORDING_
+        // ONGOING — everything the ocarina/scarecrow system goes through.
+        s32 coopMsgIsOcarina =
+            (play->msgCtx.msgMode >= MSGMODE_OCARINA_STARTING) &&
+            (play->msgCtx.msgMode <= MSGMODE_SCARECROW_RECORDING_ONGOING);
+        s32 coopMsgIsHidingMsg =
+            (play->msgCtx.msgMode != MSGMODE_NONE) && !coopMsgIsOcarina;
+        // SoH multiplayer: P1 first-person aim does NOT hide P2 anymore.
+        // Original reason for that hide was avoiding the Gohma fight
+        // breaking (P2 wandering near the ceiling trigger) and a vague
+        // "vanilla expects single-player aim" concern. User explicitly
+        // requested P2 keep functioning during P1 aim mode — P2 still
+        // gets their own PiP view and can move/shoot independently
+        // while P1 is in first-person.
+        (void)coopP1FirstPerson; // kept declared for future use
+        s32 coopShouldHide = Play_InCsMode(play) ||
+            play->pauseCtx.state != 0 ||
+            play->pauseCtx.debugState != 0 ||
+            play->gameOverCtx.state != GAMEOVER_INACTIVE ||
+            play->transitionTrigger != TRANS_TRIGGER_OFF ||
+            play->transitionMode != 0 ||
+            coopMsgIsHidingMsg ||
+            coopP1InTransition;
+
+        // SoH multiplayer: falling-edge transition snap. Tracks whether
+        // P1 was in a transition state last frame, and when that goes
+        // from true → false we teleport P2 to P1's current position.
+        // This catches every "P1 just finished something" boundary:
+        // crawlspace exit (within-room), door cutscene end, item-get
+        // cutscene end, death respawn, NaviCall end, etc. — basically
+        // any case where P1 ended up somewhere new while P2 was frozen.
+        // The room-transition and door rising/falling snaps above
+        // handle most of these too, but those only catch specific
+        // events; this generic one is the safety net so the user's
+        // "P2 needs to follow P1 on every door interaction" requirement
+        // is met without enumerating each transition kind.
+        //
+        // Within-room crawlspace exit was the specific repro: P1
+        // crawled through, ended up on the other side, STATE2_CRAWLING
+        // cleared, P2 was still standing at the crawlspace entry on
+        // the old side (frozen there for the duration of the crawl).
+        // P2's invisible collision body was apparently also blocking
+        // P1's exit animation, leaving P1's camera locked in
+        // CAM_SET_CRAWLSPACE because P1 never reached the exit point.
+        // Snapping P2 to P1's position on the falling edge moves P2
+        // out of the crawlspace zone immediately, freeing P1's exit.
+        static s32 sCoopP1WasHiding = 0;
+        if (sCoopP1WasHiding && !coopShouldHide && coopP1 != NULL && coopP1 != this &&
+            coopP1->actor.world.pos.x == coopP1->actor.world.pos.x &&
+            coopP1->actor.world.pos.y == coopP1->actor.world.pos.y &&
+            coopP1->actor.world.pos.z == coopP1->actor.world.pos.z) {
+            this->actor.world.pos = coopP1->actor.world.pos;
+            this->actor.prevPos = coopP1->actor.world.pos;
+            this->actor.home.pos = coopP1->actor.world.pos;
+            this->actor.velocity.x = 0.0f;
+            this->actor.velocity.y = 0.0f;
+            this->actor.velocity.z = 0.0f;
+            this->linearVelocity = 0.0f;
+            this->actor.speedXZ = 0.0f;
+            this->unk_450 = coopP1->actor.world.pos;
+            this->unk_45C = coopP1->actor.world.pos;
+        }
+        sCoopP1WasHiding = coopShouldHide;
+
+        if (coopShouldHide) {
+            this->actor.draw = NULL;
+            // Also move P2's collision body to P1's position while
+            // hidden, so P2's invisible-but-present collision doesn't
+            // block P1's animations (the crawlspace exit lock was
+            // traced to P1 colliding with the frozen-in-place P2
+            // body still sitting at the crawlspace entry).
+            if (coopP1 != NULL && coopP1 != this) {
+                this->actor.world.pos = coopP1->actor.world.pos;
+                this->actor.prevPos = coopP1->actor.world.pos;
+            }
+            return;
+        } else {
+            this->actor.draw = Player_Draw;
+        }
+    }
+
     if (Player_UpdateNoclip(this, play)) {
         if (gSaveContext.dogParams < 0) {
             // Disable object dependency to prevent losing dog in scenes other than market
@@ -12303,7 +13691,8 @@ void Player_Update(Actor* thisx, PlayState* play) {
         if (this->stateFlags1 & (PLAYER_STATE1_INPUT_DISABLED | PLAYER_STATE1_IN_CUTSCENE)) {
             memset(&sp44, 0, sizeof(sp44));
         } else {
-            sp44 = play->state.input[0];
+            // SoH multiplayer: route input by player index. P1=slot0, P2=slot1.
+            sp44 = play->state.input[PLAYER_GET_INDEX(&this->actor)];
             if (this->textboxBtnCooldownTimer != 0) {
                 sp44.cur.button &= ~(BTN_A | BTN_B | BTN_CUP);
                 sp44.press.button &= ~(BTN_A | BTN_B | BTN_CUP);
@@ -12320,7 +13709,92 @@ void Player_Update(Actor* thisx, PlayState* play) {
             }
         }
 
+        // SoH multiplayer: swap play->activeCamera to P2's sub-camera
+        // for the duration of P2's Player_UpdateCommon. All vanilla calls
+        // to GET_ACTIVE_CAM(play) and Play_GetCamera(play, SUBCAM_ACTIVE)
+        // inside the update — including Camera_ChangeMode, Camera_ChangeSetting,
+        // and any camera-mode reads — will hit P2's camera instead of main.
+        // Restored on exit. P1's update sees activeCamera == MAIN_CAM as
+        // before. Hardcoded Play_GetCamera(play, SUBCAM_ACTIVE) calls in player code
+        // were globally rewritten to SUBCAM_ACTIVE to participate in this swap.
+        //
+        // Defensive: also check that the camera POINTER is valid, not
+        // just the id. After Play_ClearAllSubCameras (scene transitions)
+        // the id can be stale even if we missed the reset hook — gating
+        // here prevents Camera_ChangeMode from dereferencing NULL.
+        s16 coopSavedActiveCamera = play->activeCamera;
+        if (PLAYER_GET_INDEX(&this->actor) != 0 &&
+            gCoopP2CameraId != SUBCAM_NONE &&
+            play->cameraPtrs[gCoopP2CameraId] != NULL) {
+            play->activeCamera = gCoopP2CameraId;
+
+            // SoH multiplayer: stage gCoopP2CameraYaw/Pitch into P2's
+            // sub-camera's inputDir / camDir fields. Camera_GetInputDir
+            // Yaw / Camera_GetCamDirYaw read these directly. Vanilla
+            // player action code uses those getters to compute
+            // direction-relative angles for movement, rotation, shield
+            // aiming, item-get pose, etc. — see GET_ACTIVE_CAM reads
+            // around lines 2249, 4312, 8335, 9600, 15827, 16465.
+            //
+            // Normally the engine's Camera_Update keeps inputDir / camDir
+            // in sync with the camera's eye → at vector. P2's sub-camera
+            // sits at CAM_STAT_WAIT (intentionally — having two active
+            // cameras would race over play->view), so Camera_Update is
+            // mostly a no-op for it and these fields stay stale at
+            // whatever Camera_InitPlayerSettings wrote during spawn.
+            //
+            // Result without this stage: every GET_ACTIVE_CAM camera-
+            // direction read inside Player_UpdateCommon (called for P2)
+            // returned a stale yaw — typically wherever the camera was
+            // pointing on the FIRST frame of the scene. Player rotation
+            // calc, shield aiming, item-get pose, D-pad warp, etc. all
+            // worked against that stale value, producing the "controls
+            // feel wrong / movement direction unrelated to my camera"
+            // symptom.
+            //
+            // Lock-on case: when P2 has a focusActor, the PiP camera in
+            // z_play.c positions the eye behind P2 along the P2→target
+            // line, so the camera's "forward" is the toward-target
+            // direction. inputDir.y for movement should likewise point
+            // toward target — same as the stick-conversion handling at
+            // line 2218 already does.
+            Camera* coopP2Cam = play->cameraPtrs[gCoopP2CameraId];
+            s16 coopP2InputYaw;
+            if (this->focusActor != NULL) {
+                f32 coopFdx = this->focusActor->world.pos.x - this->actor.world.pos.x;
+                f32 coopFdz = this->focusActor->world.pos.z - this->actor.world.pos.z;
+                coopP2InputYaw = Math_Atan2S(coopFdz, coopFdx);
+            } else {
+                coopP2InputYaw = (s16)gCoopP2CameraYaw;
+            }
+            s16 coopP2InputPitch = (s16)gCoopP2CameraPitch;
+            coopP2Cam->inputDir.x = coopP2InputPitch;
+            coopP2Cam->inputDir.y = coopP2InputYaw;
+            coopP2Cam->inputDir.z = 0;
+            coopP2Cam->camDir.x = coopP2InputPitch;
+            coopP2Cam->camDir.y = coopP2InputYaw;
+            coopP2Cam->camDir.z = 0;
+        }
+
+        // SoH multiplayer: lazy-spawn P2's dedicated Navi.
+        // 0x100 bit on params is the P2-Navi marker (EnElf_Init reads
+        // it). Spawning here on P2's update frame guarantees the
+        // EN_ELF overlay's object table slot is loaded.
+        if (PLAYER_GET_INDEX(&this->actor) != 0 &&
+            gCoopP2NaviActor == NULL &&
+            CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0)) {
+            Vec3f coopNaviSpawnPos = this->actor.world.pos;
+            coopNaviSpawnPos.y += 40.0f;
+            gCoopP2NaviActor = Actor_Spawn(&play->actorCtx, play, ACTOR_EN_ELF,
+                                           coopNaviSpawnPos.x,
+                                           coopNaviSpawnPos.y,
+                                           coopNaviSpawnPos.z,
+                                           0, 0, 0,
+                                           0x0100 | FAIRY_NAVI);
+        }
+
         Player_UpdateCommon(this, play, &sp44);
+        play->activeCamera = coopSavedActiveCamera;
     }
 
     MREG(52) = this->actor.world.pos.x;
@@ -12391,7 +13865,66 @@ void Player_Update(Actor* thisx, PlayState* play) {
         // func_8002F974(&player->actor, NA_SE_EV_WIND_TRAP - SFX_FLAG);
     }
 
+    // SoH multiplayer: P2 watchdog. Recovers from two failure modes:
+    //   1. NaN crept into position/velocity (math bug elsewhere in update path).
+    //   2. P2 got separated from P1 by more than 5000 units. This catches
+    //      cutscenes that teleport P1 (Deku Baba pre-Deku-Tree, owl drops,
+    //      etc.) leaving P2 stranded in the previous spot.
+    // Either way: snap P2 to P1 with zero velocity. Stale-by-one-frame
+    // distance/yaw fields are harmless; a missing P2 is not.
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        Player* coopP1 = (Player*)play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        if (coopP1 != NULL && coopP1 != this) {
+            s32 coopBad = 0;
+            if (this->actor.world.pos.x != this->actor.world.pos.x) coopBad = 1;
+            if (this->actor.world.pos.y != this->actor.world.pos.y) coopBad = 1;
+            if (this->actor.world.pos.z != this->actor.world.pos.z) coopBad = 1;
+            if (this->actor.velocity.x != this->actor.velocity.x) coopBad = 1;
+            if (this->actor.velocity.y != this->actor.velocity.y) coopBad = 1;
+            if (this->actor.velocity.z != this->actor.velocity.z) coopBad = 1;
+            if (!coopBad) {
+                f32 coopDx = this->actor.world.pos.x - coopP1->actor.world.pos.x;
+                f32 coopDy = this->actor.world.pos.y - coopP1->actor.world.pos.y;
+                f32 coopDz = this->actor.world.pos.z - coopP1->actor.world.pos.z;
+                f32 coopDistSq = coopDx*coopDx + coopDy*coopDy + coopDz*coopDz;
+                if (coopDistSq > 25000000.0f) coopBad = 1;  // (5000 units)^2
+            }
+            if (coopBad) {
+                this->actor.world.pos = coopP1->actor.world.pos;
+                this->actor.prevPos = coopP1->actor.world.pos;
+                this->actor.home.pos = coopP1->actor.world.pos;
+                this->actor.velocity.x = 0.0f;
+                this->actor.velocity.y = 0.0f;
+                this->actor.velocity.z = 0.0f;
+                this->linearVelocity = 0.0f;
+                this->actor.speedXZ = 0.0f;
+                this->unk_450 = coopP1->actor.world.pos;
+                this->unk_45C = coopP1->actor.world.pos;
+            }
+        }
+    }
+
+    // SoH multiplayer: stash the currently-updating Player on a file-
+    // scope pointer so OnPlayerUpdate hooks can tell which player's
+    // update triggered them. With co-op enabled, Player_UpdateCommon
+    // runs once for P1 and once for P2 each frame, and the hooks all
+    // fire from GameInteractor_ExecuteOnPlayerUpdate below — without
+    // this signal there's no way for a hook (which doesn't take a
+    // Player argument) to know whether it's being called from P1's
+    // tick or P2's. Several randomizer hooks read GET_PLAYER → P1 and
+    // write to P1's state; double-firing them once per real frame
+    // wastes work and produced the duplicate "Attempting to give
+    // Item..." log lines we saw in the crash log. Gating those hooks
+    // on PLAYER_GET_INDEX(sCurrentlyUpdatingPlayer) == 0 turns them
+    // back into once-per-frame.
+    //
+    // Set right before the fire, cleared right after, so the pointer
+    // is only valid during synchronous hook execution. Defined as a
+    // C symbol (no static) so the C++ hook_handlers.cpp can extern-
+    // declare it without a header dependency.
+    sCurrentlyUpdatingPlayer = this;
     GameInteractor_ExecuteOnPlayerUpdate();
+    sCurrentlyUpdatingPlayer = NULL;
 }
 
 typedef struct BunnyEarKinematics {
@@ -13007,7 +14540,7 @@ void Player_Action_Talk(Player* this, PlayState* play) {
             this->stateFlags2 &= ~PLAYER_STATE2_LOCK_ON_WITH_SWITCH;
         }
 
-        func_8005B1A4(Play_GetCamera(play, 0));
+        func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
 
         if (!func_8084B4D4(play, this) && !func_8084B3CC(play, this) && !Player_StartCsAction(play, this)) {
             if ((this->talkActor != this->interactRangeActor) || !Player_ActionHandler_2(this, play)) {
@@ -13850,7 +15383,7 @@ void Player_Action_8084D3E4(Player* this, PlayState* play) {
             gSaveContext.horseData.angle = rideActor->actor.shape.rot.y;
         }
     } else {
-        Camera_ChangeSetting(Play_GetCamera(play, 0), CAM_SET_NORMAL0);
+        Camera_ChangeSetting(Play_GetCamera(play, SUBCAM_ACTIVE), CAM_SET_NORMAL0);
 
         if (this->mountSide < 0) {
             D_808549C4[0].data = ANIMSFX_DATA(ANIMSFX_TYPE_LANDING, 40);
@@ -14108,7 +15641,7 @@ void func_8084DF6C(PlayState* play, Player* this) {
     this->stateFlags1 &= ~(PLAYER_STATE1_GETTING_ITEM | PLAYER_STATE1_CARRYING_ACTOR);
     this->getItemId = GI_NONE;
     this->getItemEntry = (GetItemEntry)GET_ITEM_NONE;
-    func_8005B1A4(Play_GetCamera(play, 0));
+    func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
 }
 
 void func_8084DFAC(PlayState* play, Player* this) {
@@ -14126,6 +15659,46 @@ s32 func_8084DFF4(PlayState* play, Player* this) {
     static bool equipNow;
 
     if (this->getItemId == GI_NONE && this->getItemEntry.objectId == OBJECT_INVALID) {
+        return 1;
+    }
+
+    // SoH multiplayer: skip the "You got X!" textbox entirely for P2.
+    // The dialog flow is heavily tied to the global msgCtx, advances on
+    // GET_PLAYER (P1) input by default, and there are several gates
+    // throughout the message pipeline that effectively keep P2 stuck
+    // waiting indefinitely (no dialog visible, but the action func sits
+    // waiting for getItemId to clear, which only happens when msgCtx
+    // hits TEXT_STATE_CLOSING). Even with our Message_ShouldAdvance
+    // patch accepting Port 1 input, edge cases still pin P2 in the
+    // item-get pose. The dialog is purely cosmetic — Item_Give actually
+    // grants the item to the shared inventory, which both players use.
+    // So for P2 we silently give the item, set pending flags, and
+    // signal "ready" so the animation can release cleanly.
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        if (this->getItemEntry.objectId == OBJECT_INVALID || (this->getItemId != this->getItemEntry.getItemId)) {
+            giEntry = ItemTable_Retrieve(this->getItemId);
+        } else {
+            giEntry = this->getItemEntry;
+        }
+        if (!(giEntry.modIndex == MOD_RANDOMIZER && giEntry.itemId == RG_ICE_TRAP)) {
+            if (giEntry.modIndex == MOD_NONE) {
+                if (giEntry.getItemId == GI_SWORD_BGS) {
+                    gSaveContext.bgsFlag = true;
+                    gSaveContext.swordHealth = 8;
+                }
+                Item_Give(play, giEntry.itemId);
+            } else if (giEntry.modIndex == MOD_RANDOMIZER) {
+                Randomizer_Item_Give(play, giEntry);
+            }
+            Player_SetPendingFlag(this, play);
+        } else {
+            // Ice trap: still mark as pending so the trap fires later
+            gSaveContext.ship.pendingIceTrapCount++;
+            Player_SetPendingFlag(this, play);
+        }
+        this->getItemId = GI_NONE;
+        this->getItemEntry = (GetItemEntry)GET_ITEM_NONE;
+        this->av1.actionVar1 = 0;
         return 1;
     }
 
@@ -14315,7 +15888,7 @@ void Player_Action_8084E3C4(Player* this, PlayState* play) {
     }
 
     if (play->msgCtx.ocarinaMode == OCARINA_MODE_04) {
-        func_8005B1A4(Play_GetCamera(play, 0));
+        func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
 
         if ((this->talkActor != NULL) && (this->talkActor == this->unk_6A8)) {
             Player_StartTalking(play, this->talkActor);
@@ -14440,7 +16013,20 @@ void Player_Action_8084E6D4(Player* this, PlayState* play) {
         }
 
         if (this->skelAnime.animation == &gPlayerAnim_link_demo_get_itemB) {
-            Math_ScaledStepToS(&this->actor.shape.rot.y, Camera_GetCamDirYaw(GET_ACTIVE_CAM(play)) + 0x8000, 4000);
+            // SoH multiplayer: rotate P2 to face the camera that ACTUALLY
+            // shows them, not the stale sub-cam. Otherwise P2 in PiP mode
+            // would face some random direction during item-get animations.
+            extern f32 gCoopP2CameraYaw;
+            s16 coopItemFaceYaw;
+            if (PLAYER_GET_INDEX(&this->actor) != 0 &&
+                Coop_PiPActiveForScene(play)) {
+                coopItemFaceYaw = (s16)gCoopP2CameraYaw;
+            } else if (PLAYER_GET_INDEX(&this->actor) != 0) {
+                coopItemFaceYaw = Camera_GetCamDirYaw(Play_GetCamera(play, MAIN_CAM));
+            } else {
+                coopItemFaceYaw = Camera_GetCamDirYaw(GET_ACTIVE_CAM(play));
+            }
+            Math_ScaledStepToS(&this->actor.shape.rot.y, coopItemFaceYaw + 0x8000, 4000);
         }
 
         if (LinkAnimation_OnFrame(&this->skelAnime, 21.0f)) {
@@ -14529,7 +16115,7 @@ void Player_Action_8084EAC0(Player* this, PlayState* play) {
             this->av2.actionVar2 = 1;
         } else {
             func_8083C0E8(this, play);
-            func_8005B1A4(Play_GetCamera(play, 0));
+            func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
         }
     } else if (this->av2.actionVar2 == 1) {
         if ((gSaveContext.healthAccumulator == 0) && (gSaveContext.magicState != MAGIC_STATE_FILL)) {
@@ -14587,7 +16173,7 @@ void Player_Action_SwingBottle(Player* this, PlayState* play) {
                 this->av2.startedTextbox = true;
             } else if (Message_GetState(&play->msgCtx) == TEXT_STATE_CLOSING) {
                 this->av1.bottleCatchType = BOTTLE_CATCH_NONE;
-                func_8005B1A4(Play_GetCamera(play, 0));
+                func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
             }
         } else {
             func_8083C0E8(this, play);
@@ -14647,7 +16233,7 @@ static Vec3f D_80854A1C = { 0.0f, 0.0f, 5.0f };
 void Player_Action_8084EED8(Player* this, PlayState* play) {
     if (LinkAnimation_Update(play, &this->skelAnime)) {
         func_8083C0E8(this, play);
-        func_8005B1A4(Play_GetCamera(play, 0));
+        func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
         return;
     }
 
@@ -14679,7 +16265,7 @@ void Player_Action_8084EFC0(Player* this, PlayState* play) {
 
     if (LinkAnimation_Update(play, &this->skelAnime)) {
         func_8083C0E8(this, play);
-        func_8005B1A4(Play_GetCamera(play, 0));
+        func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
         return;
     }
 
@@ -14703,6 +16289,38 @@ static AnimSfxEntry D_80854A3C[] = {
 };
 
 void Player_Action_ExchangeItem(Player* this, PlayState* play) {
+    // SoH multiplayer: P2 can't participate in the trade-item show /
+    // exchange flow. The vanilla action plays a "show item above head"
+    // animation, then opens a textbox (item description or NPC trade
+    // dialog) and waits for it to close before transitioning back to
+    // idle. For P2 the textbox path gets stuck — Message_GetState never
+    // hits TEXT_STATE_CLOSING from P2's perspective because the dialog
+    // state machine is owned by GET_PLAYER (P1), so the action sits
+    // forever in the show pose. Worse, the held item stays attached to
+    // P2's hand visually even after death/respawn because the cleanup
+    // path (exchangeItemId → EXCH_ITEM_NONE + put-away animation +
+    // func_8083C0E8) never runs.
+    //
+    // Fix: short-circuit the action for P2. Clear the cutscene state
+    // flags it set on entry, force-clear exchangeItemId so the held-
+    // item rendering picks up the cleared slot, put away whatever
+    // P2 was holding via Player_UseItem(ITEM_NONE), and drop back to
+    // the idle action. P2 still presses the C-button mapped to a
+    // trade item, briefly enters the action this same frame, and
+    // immediately exits — no stuck pose, no floating item on respawn.
+    // P1 retains full vanilla trade behavior.
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        this->stateFlags1 &= ~(PLAYER_STATE1_TALKING |
+                               PLAYER_STATE1_IN_ITEM_CS |
+                               PLAYER_STATE1_IN_CUTSCENE);
+        this->exchangeItemId = EXCH_ITEM_NONE;
+        this->actor.flags &= ~ACTOR_FLAG_TALK;
+        this->unk_862 = 0;
+        Player_UseItem(play, this, ITEM_NONE);
+        func_8083C0E8(this, play);
+        return;
+    }
+
     this->stateFlags2 |= PLAYER_STATE2_DISABLE_ROTATION_Z_TARGET;
 
     if (LinkAnimation_Update(play, &this->skelAnime)) {
@@ -14749,7 +16367,7 @@ void Player_Action_ExchangeItem(Player* this, PlayState* play) {
                     func_8083C0E8(this, play);
                 }
 
-                func_8005B1A4(Play_GetCamera(play, 0));
+                func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
             }
         }
     } else if (this->av2.actionVar2 >= 0) {
@@ -15020,7 +16638,7 @@ s32 Player_UpdateNoclip(Player* this, PlayState* play) {
         sNoclipEnabled ^= 1;
 
         if (sNoclipEnabled) {
-            Camera_ChangeMode(Play_GetCamera(play, 0), CAM_MODE_BOWARROWZ);
+            Camera_ChangeMode(Play_GetCamera(play, SUBCAM_ACTIVE), CAM_MODE_BOWARROWZ);
         }
     }
 
@@ -15271,7 +16889,7 @@ void Player_Action_8085063C(Player* this, PlayState* play) {
         }
 
         func_80853080(this, play);
-        func_8005B1A4(Play_GetCamera(play, 0));
+        func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
     }
 }
 
@@ -15339,7 +16957,7 @@ void Player_Action_808507F4(Player* this, PlayState* play) {
             if ((this->itemAction == PLAYER_IA_NAYRUS_LOVE) || isFastFarores ||
                 (gSaveContext.magicState == MAGIC_STATE_IDLE)) {
                 func_80839FFC(this, play);
-                func_8005B1A4(Play_GetCamera(play, 0));
+                func_8005B1A4(Play_GetCamera(play, SUBCAM_ACTIVE));
             }
         } else {
             if (this->av2.actionVar2 == 0) {

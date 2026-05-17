@@ -443,11 +443,26 @@ void EnBox_WaitOpen(EnBox* this, PlayState* play) {
         osSyncPrintf("Actor_Environment_Tbox_On() %d\n", this->dyna.actor.params & 0x1F);
         Flags_SetTreasure(play, this->dyna.actor.params & 0x1F);
     } else {
-        player = GET_PLAYER(play);
-        Actor_WorldToActorCoords(&this->dyna.actor, &sp4C, &player->actor.world.pos);
-        if (sp4C.z > -50.0f && sp4C.z < 0.0f && fabsf(sp4C.y) < 10.0f && fabsf(sp4C.x) < 20.0f &&
-            Player_IsFacingActor(&this->dyna.actor, 0x3000, play)) {
-            Actor_OfferGetItemNearby(&this->dyna.actor, play, -(this->dyna.actor.params >> 5 & 0x7F));
+        // SoH multiplayer: iterate every player actor, not just P1. Without
+        // this, the chest's "is a player close + facing me?" gate uses
+        // GET_PLAYER (P1 only), so P2 can't open chests even when standing
+        // right in front of one. Actor_OfferGetItem (called below) is
+        // already co-op-aware and will dispatch the item to whichever
+        // player is closest, so we just need any player to satisfy the
+        // proximity + facing condition for the offer to fire.
+        Actor* coopChestPlayer = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        for (; coopChestPlayer != NULL; coopChestPlayer = coopChestPlayer->next) {
+            Actor_WorldToActorCoords(&this->dyna.actor, &sp4C, &coopChestPlayer->world.pos);
+            if (sp4C.z > -50.0f && sp4C.z < 0.0f && fabsf(sp4C.y) < 10.0f && fabsf(sp4C.x) < 20.0f) {
+                // Per-player facing check (Player_IsFacingActor uses
+                // GET_PLAYER, so we recompute manually for this iteration).
+                s16 coopYawToChest = Math_Vec3f_Yaw(&coopChestPlayer->world.pos, &this->dyna.actor.world.pos);
+                s16 coopFacingDiff = coopYawToChest - coopChestPlayer->shape.rot.y;
+                if (ABS(coopFacingDiff) < 0x3000) {
+                    Actor_OfferGetItemNearby(&this->dyna.actor, play, -(this->dyna.actor.params >> 5 & 0x7F));
+                    break;
+                }
+            }
         }
         if (Flags_GetTreasure(play, this->dyna.actor.params & 0x1F)) {
             EnBox_SetupAction(this, EnBox_Open);

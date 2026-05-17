@@ -5411,7 +5411,15 @@ void Interface_Draw(PlayState* play) {
             Interface_DrawMagicBar(play);
         }
 
-        Minimap_Draw(play);
+        // SoH multiplayer: when PiP is enabled, the bottom-right corner
+        // is occupied by P2's view. The minimap (in OVERLAY_DISP) gets
+        // drawn AFTER all 3D content by the gfx pipeline, so it would
+        // always render on top of the PiP regardless of code order. Skip
+        // it entirely when PiP is on; user can disable PiP to get the
+        // minimap back.
+        if (!Coop_PiPActiveForScene(play)) {
+            Minimap_Draw(play);
+        }
 
         if ((R_PAUSE_MENU_MODE != 2) && (R_PAUSE_MENU_MODE != 3)) {
             if (CVarGetInteger(CVAR_ENHANCEMENT("MirroredWorld"), 0)) {

@@ -7517,6 +7517,69 @@ Vec3s Camera_Update(Camera* camera) {
 
     if (camera->player != NULL) {
         Actor_GetWorldPosShapeRot(&curPlayerPosRot, &camera->player->actor);
+
+        // SoH multiplayer: dynamic camera that frames both players, but ONLY
+        // during CAM_MODE_NORMAL (free-walking). Z-target (CAM_MODE_TARGET /
+        // BATTLE), first-person (CAM_MODE_FIRSTPERSON / BOWARROW / SLINGSHOT),
+        // climb, hookshot, and all scripted/cutscene modes get vanilla math
+        // because they have specific eye/at calculations that fall apart if
+        // we shift the focal point. The mode check is the key fix vs. the
+        // original midpoint hijack — it lets dynamic framing happen during
+        // walking but stays out of the way of the modes that need precise
+        // single-player camera control.
+        // When PiP is enabled, each player has their own dedicated view, so
+        // the dynamic shared midpoint camera becomes counterproductive — the
+        // user wants vanilla single-player camera behavior in BOTH the main
+        // view and the PiP. Gate the midpoint to only run when PiP is OFF.
+        if (camera->mode == CAM_MODE_NORMAL &&
+            !Coop_PiPActiveForScene(camera->play)) {
+            Vec3f sum = curPlayerPosRot.pos;
+            s32 count = 1;
+            f32 maxSpread = 0.0f;
+            Actor* coopP = camera->play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+            for (; coopP != NULL; coopP = coopP->next) { if (coopP->category != ACTORCAT_PLAYER || PLAYER_GET_INDEX(coopP) == 0) continue;
+                if (coopP->world.pos.x != coopP->world.pos.x) continue;
+                if (coopP->world.pos.y != coopP->world.pos.y) continue;
+                if (coopP->world.pos.z != coopP->world.pos.z) continue;
+                f32 d = OLib_Vec3fDist(&curPlayerPosRot.pos, &coopP->world.pos);
+                if (d > maxSpread) maxSpread = d;
+                sum.x += coopP->world.pos.x;
+                sum.y += coopP->world.pos.y;
+                sum.z += coopP->world.pos.z;
+                count++;
+            }
+            // Only shift to midpoint when players are meaningfully spread.
+            // Threshold prevents micro-drift in tight indoor scenes from
+            // confusing scene-tuned cameras.
+            if (maxSpread > 100.0f) {
+                curPlayerPosRot.pos.x = sum.x / count;
+                curPlayerPosRot.pos.y = sum.y / count;
+                curPlayerPosRot.pos.z = sum.z / count;
+            }
+        }
+
+        // SoH multiplayer (Tier 1): when a non-P1 player is actively interacting
+        // (talking to an NPC, holding an item-get), point the camera at THEM
+        // instead of P1 for the duration. Detection is via talkActor — vanilla
+        // sets it when a Player initiates dialog with another actor.
+        // gameOverCtx is also a P1-takeover signal so P2 doesn't get camera
+        // even if their state happens to be active during P1 death.
+        {
+            Actor* coopP = camera->play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+            for (; coopP != NULL; coopP = coopP->next) { if (coopP->category != ACTORCAT_PLAYER || PLAYER_GET_INDEX(coopP) == 0) continue;
+                Player* coopOther = (Player*)coopP;
+                if (coopOther->talkActor != NULL &&
+                    camera->play->msgCtx.msgMode != MSGMODE_NONE &&
+                    camera->play->gameOverCtx.state == GAMEOVER_INACTIVE &&
+                    coopP->world.pos.x == coopP->world.pos.x &&
+                    coopP->world.pos.y == coopP->world.pos.y &&
+                    coopP->world.pos.z == coopP->world.pos.z) {
+                    Actor_GetWorldPosShapeRot(&curPlayerPosRot, coopP);
+                    break;
+                }
+            }
+        }
+
         camera->xzSpeed = playerXZSpeed = OLib_Vec3fDistXZ(&curPlayerPosRot.pos, &camera->playerPosRot.pos);
 
         camera->speedRatio = OLib_ClampMaxDist(playerXZSpeed / (func_8002DCE4(camera->player) * PCT(OREG(8))), 1.0f);
@@ -7676,6 +7739,65 @@ Vec3s Camera_Update(Camera* camera) {
     } else {
         viewAt = camera->at;
         viewEye = camera->eye;
+
+        // SoH multiplayer: zoom out based on player spread during normal play.
+        // Only applies in modes where the camera is supposed to track the
+        // player — fixed cameras and prerendered backgrounds have hardcoded
+        // eye positions that would be distorted by this scaling.
+        // When PiP is enabled, each player has their own dedicated view, so
+        // the dynamic spread-based FOV widening becomes counterproductive
+        // (P1's view shouldn't pull back when P2 wanders off — P2 has their
+        // own camera in the PiP). Same gating logic as the midpoint hijack.
+        // ALSO require CAM_MODE_NORMAL: when the player enters first-person
+        // aim (CAM_MODE_BOWARROW, _SLINGSHOT, _FIRSTPERSON, etc.) the eye is
+        // positioned AT Link's head. Pulling it back via this scaling makes
+        // Link's head visible to the player from outside, breaking aim.
+        if (!Play_InCsMode(camera->play) &&
+            !Coop_PiPActiveForScene(camera->play) &&
+            camera->mode == CAM_MODE_NORMAL) {
+            s32 coopAllowZoom = 0;
+            switch (camera->setting) {
+                case CAM_SET_NORMAL0:
+                case CAM_SET_NORMAL1:
+                case CAM_SET_NORMAL3:
+                case CAM_SET_DUNGEON0:
+                case CAM_SET_DUNGEON1:
+                case CAM_SET_DUNGEON2:
+                case CAM_SET_HORSE:
+                    coopAllowZoom = 1;
+                    break;
+                default:
+                    coopAllowZoom = 0;
+                    break;
+            }
+            if (coopAllowZoom) {
+                Actor* coopP1 = camera->play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+                if (coopP1 != NULL && coopP1->next != NULL) {
+                    Actor* coopP2 = coopP1->next;
+                    if (coopP2->world.pos.x == coopP2->world.pos.x &&
+                        coopP2->world.pos.y == coopP2->world.pos.y &&
+                        coopP2->world.pos.z == coopP2->world.pos.z) {
+                        f32 coopSpread = OLib_Vec3fDist(&coopP1->world.pos, &coopP2->world.pos);
+                        f32 coopSpreadMul = 1.0f + (coopSpread / 300.0f);
+                        Vec3f coopProposedEye;
+                        coopProposedEye.x = viewAt.x + (viewEye.x - viewAt.x) * coopSpreadMul;
+                        coopProposedEye.y = viewAt.y + (viewEye.y - viewAt.y) * coopSpreadMul;
+                        coopProposedEye.z = viewAt.z + (viewEye.z - viewAt.z) * coopSpreadMul;
+                        // SoH multiplayer: collision-clamp the proposed eye
+                        // position. Without this, pulling back to capture
+                        // both players causes the camera to clip through
+                        // walls and ceilings in tight rooms (Kakariko houses,
+                        // Deku Tree corridors, etc.). Camera_BGCheck raycasts
+                        // from viewAt to the proposed eye and updates
+                        // coopProposedEye to the hit point if the ray hits
+                        // any geometry. Returns 0 if no collision.
+                        Camera_BGCheck(camera, &viewAt, &coopProposedEye);
+                        viewEye = coopProposedEye;
+                    }
+                }
+            }
+        }
+
         OLib_Vec3fDiffToVecSphGeo(&eyeAtAngle, &viewEye, &viewAt);
         Camera_CalcUpFromPitchYawRoll(&viewUp, eyeAtAngle.pitch, eyeAtAngle.yaw, camera->roll);
         viewFov = camera->fov;

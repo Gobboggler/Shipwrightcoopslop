@@ -102,6 +102,26 @@ void EnBoom_Init(Actor* thisx, PlayState* play) {
 void EnBoom_Destroy(Actor* thisx, PlayState* play) {
     EnBoom* this = (EnBoom*)thisx;
 
+    // SoH multiplayer: walk every player and clear any boomerangActor
+    // field still pointing at this dying boomerang. The catch-path in
+    // EnBoom_Fly already clears the thrower's pointer when the boomerang
+    // is caught normally, but other code paths (scene transition,
+    // engine cleanup, Actor_KillIfLinkLost) can free the actor without
+    // going through the catch flow — leaving every player's
+    // boomerangActor stale-pointing at freed memory. Heap reuse of that
+    // slot for the next boomerang would then make EnBoom_Fly's coop
+    // search match the wrong player, routing the new boomerang to the
+    // wrong target. Belt-and-suspenders cleanup here closes that hole.
+    {
+        Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        for (; coopP != NULL; coopP = coopP->next) {
+            Player* coopPlayer = (Player*)coopP;
+            if (coopPlayer->boomerangActor == &this->actor) {
+                coopPlayer->boomerangActor = NULL;
+            }
+        }
+    }
+
     Effect_Delete(play, this->effectIndex);
     Collider_DestroyQuad(play, &this->collider);
 }
@@ -122,7 +142,21 @@ void EnBoom_Fly(EnBoom* this, PlayState* play) {
     Vec3f hitPoint;
     s32 pad2;
 
+    // SoH multiplayer: find the actual thrower of this boomerang (any
+    // player whose boomerangActor points to this actor) so the
+    // return-to-thrower path goes to the correct player. Defaults to
+    // GET_PLAYER (P1) for single-player.
     player = GET_PLAYER(play);
+    {
+        Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        for (; coopP != NULL; coopP = coopP->next) {
+            Player* coopPlayer = (Player*)coopP;
+            if (coopPlayer->boomerangActor == &this->actor) {
+                player = coopPlayer;
+                break;
+            }
+        }
+    }
     target = this->moveTo;
 
     // If the boomerang is moving toward a targeted actor, handle setting the proper x and y angle to fly toward it.
@@ -190,6 +224,17 @@ void EnBoom_Fly(EnBoom* this, PlayState* play) {
             // Set player flags and kill the boomerang beacause Link caught it.
             player->stateFlags1 &= ~PLAYER_STATE1_BOOMERANG_THROWN;
             player->boomerangQuickRecall = false;
+            // SoH multiplayer: clear boomerangActor BEFORE Actor_Kill frees
+            // the actor memory. Without this, player->boomerangActor stays
+            // pointing at the now-freed memory until the player throws
+            // again. The bug: heap allocation can re-use that exact memory
+            // slot for the NEXT boomerang spawn — at which point BOTH the
+            // previous owner (stale pointer match) AND the actual new
+            // thrower have boomerangActor == newBoom. The coop-aware search
+            // in EnBoom_Fly walks players in list order and picks the FIRST
+            // match — usually P1. Result: P2 throws, boomerang flies to P1.
+            // Clearing the pointer here breaks that chain.
+            player->boomerangActor = NULL;
             Actor_Kill(&this->actor);
         }
     } else {
@@ -240,7 +285,20 @@ void EnBoom_Fly(EnBoom* this, PlayState* play) {
 
 void EnBoom_Update(Actor* thisx, PlayState* play) {
     EnBoom* this = (EnBoom*)thisx;
+    // SoH multiplayer: find whichever player is the thrower (the one whose
+    // boomerangActor field points to this boomerang). Defaults to GET_PLAYER
+    // (P1) if no match — this preserves single-player behavior. With this,
+    // P2 can throw the boomerang and have it return to P2 instead of flying
+    // to P1.
     Player* player = GET_PLAYER(play);
+    Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+    for (; coopP != NULL; coopP = coopP->next) {
+        Player* coopPlayer = (Player*)coopP;
+        if (coopPlayer->boomerangActor == &this->actor) {
+            player = coopPlayer;
+            break;
+        }
+    }
 
     if (!(player->stateFlags1 & PLAYER_STATE1_IN_CUTSCENE)) {
         this->actionFunc(this, play);

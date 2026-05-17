@@ -1958,6 +1958,129 @@ void SohMenu::AddMenuEnhancements() {
             .CVar(timer.timeEnable)
             .Callback([](WidgetInfo& info) { TimeDisplayUpdateDisplayOptions(); });
     }
+
+    // SoH multiplayer: Local Co-op
+    path.sidebarName = "Local Co-op";
+    AddSidebarEntry("Enhancements", path.sidebarName, 1);
+    path.column = SECTION_COLUMN_1;
+
+    AddWidget(path, "Player 2", WIDGET_SEPARATOR_TEXT);
+    AddWidget(path, "Enable Local Co-op", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.Enabled"))
+        .Options(CheckboxOptions().Tooltip(
+            "Spawn a second Link controlled by Port 2.\n\n"
+            "P2 mirrors P1's currently-equipped item, shares the hearts/ammo/rupees pool, "
+            "and hides during cutscenes, dialog, and the pause menu. P2's bow/hookshot only "
+            "fire when Z-target lock-on is active.\n\n"
+            "Configure which physical controller drives Port 2 in Settings > Controller > Port 2.\n\n"
+            "Toggle takes effect on the next scene load. Use the 'Reload Current Scene' button "
+            "below or press L + D-pad-Down on Port 1 to apply immediately."));
+    AddWidget(path, "Reload Current Scene", WIDGET_BUTTON)
+        .Callback([](WidgetInfo& info) {
+            if (gPlayState != NULL) {
+                Play_TriggerSceneReload(gPlayState);
+            }
+        })
+        .Options(ButtonOptions()
+                     .Tooltip("Reload the current scene with a fast fade. Applies the co-op toggle "
+                              "and respawns P2 next to P1. Same as pressing L + D-pad-Down.")
+                     .Size(UIWidgets::Sizes::Inline));
+
+    AddWidget(path, "P2 Tunic Colors", WIDGET_SEPARATOR_TEXT);
+    AddWidget(path, "P2 Kokiri Tunic", WIDGET_CVAR_COLOR_PICKER)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.P2.KokiriTunic"))
+        .Options(ColorPickerOptions().DefaultValue(Color_RGBA8{ 0xC8, 0x14, 0x14, 0xFF }));
+    AddWidget(path, "P2 Goron Tunic", WIDGET_CVAR_COLOR_PICKER)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.P2.GoronTunic"))
+        .Options(ColorPickerOptions().DefaultValue(Color_RGBA8{ 0x40, 0x18, 0xA0, 0xFF }));
+    AddWidget(path, "P2 Zora Tunic", WIDGET_CVAR_COLOR_PICKER)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.P2.ZoraTunic"))
+        .Options(ColorPickerOptions().DefaultValue(Color_RGBA8{ 0xE8, 0xC8, 0x30, 0xFF }));
+
+    AddWidget(path, "Experimental", WIDGET_SEPARATOR_TEXT);
+    AddWidget(path, "Split-Screen Co-op (experimental)", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.PiPPrototype"))
+        .Options(CheckboxOptions().Tooltip(
+            "EXPERIMENTAL split-screen rendering. P1 renders to the left half "
+            "of the screen, P2 to the right half. When enabled, the dynamic "
+            "shared camera and minimap are disabled — each player gets a "
+            "vanilla single-player camera in their half. Z-target works "
+            "independently per player as a future improvement; right now "
+            "only P1 has full Z-target functionality."));
+
+    AddWidget(path, "P2 Free Look (right stick camera)", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.P2.FreeLook"))
+        .Options(CheckboxOptions()
+            .DefaultValue((bool)CVarGetInteger(CVAR_SETTING("FreeLook.Enabled"), 0))
+            .Tooltip(
+                "Lets P2 rotate their split-screen camera with the right "
+                "stick on Port 2 — mirrors P1's Free Look enhancement. "
+                "Defaults to whatever P1's Free Look setting is. Disable "
+                "this if a second player finds dual-stick camera control "
+                "confusing; P2 still gets vanilla camera tracking + the "
+                "delayed-recenter behavior either way."));
+
+    AddWidget(path, "P2 Lock-On", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.P2.AllowLockOn"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "When ON (default), P2 can press Z to lock on to enemies and "
+            "engage Parallel/recenter mode just like P1.\n\n"
+            "Boss fights are automatically rendered in split-screen "
+            "regardless of your main PiP setting, so each player gets "
+            "their own camera in boss arenas — that prevents P2's lock-on "
+            "from affecting P1's framing in any of the ten boss scenes "
+            "(Gohma, King Dodongo, Barinade, Phantom Ganon, Volvagia, "
+            "Morpha, Twinrova, Bongo Bongo, Ganondorf, Ganon).\n\n"
+            "Turn OFF only if you specifically want to disable P2's "
+            "lock-on. P2 still gets C-button auto-target firing for "
+            "ranged weapons either way."));
+
+    // SoH multiplayer: reticle position fine-tuning sliders.
+    //
+    // Even after the viewport-aware NDC-to-pixel math in
+    // func_8002C124 (z_actor.c) and the matching projection in the
+    // PiP block's hand-rolled corner brackets (z_play.c), reticles
+    // can still land a few pixels off the visible target. The most
+    // likely culprit is libultraship's widescreen handling:
+    // `AdjXForAspectRatio` applies to every 3D vertex's clip-space
+    // x but doesn't touch HUD ortho coords or gDPFillRectangle
+    // pixel rects, so the same world point projects through the
+    // rendered scene to one screen pixel and through the HUD path
+    // to a slightly different one. The exact discrepancy depends
+    // on display aspect ratio and is too small to robustly compute
+    // from first principles inside the engine.
+    //
+    // Pragmatic fix: expose per-player X/Y offset sliders here so
+    // the user can dial in alignment by eye. Range chosen generous
+    // (+/- 50 internal pixels) since the offsets only matter at
+    // small magnitudes and a wide range doesn't hurt. Defaults
+    // chosen to match prior hardcoded values:
+    //   - P1: 0/0 (vanilla code never offset P1)
+    //   - P2: 5/0 (the corner-bracket draw used to add +5 X / +0 Y
+    //     as a baked-in nudge; matching default keeps behavior
+    //     identical for users who never touch the slider).
+    AddWidget(path, "Reticle Alignment", WIDGET_SEPARATOR_TEXT);
+    AddWidget(path, "P1 Reticle X Offset: %.1fpx", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.P1.ReticleOffsetX"))
+        .Options(FloatSliderOptions().Format("%.1f").Min(-50.0f).Max(50.0f).DefaultValue(0.0f)
+            .Tooltip("Horizontal nudge for P1's lock-on reticle in HUD pixels. "
+                     "Use if the reticle appears slightly off-target horizontally. "
+                     "Positive = right, negative = left. Affects shared-mode and "
+                     "split-screen the same way; default 0 matches vanilla."));
+    AddWidget(path, "P1 Reticle Y Offset: %.1fpx", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.P1.ReticleOffsetY"))
+        .Options(FloatSliderOptions().Format("%.1f").Min(-50.0f).Max(50.0f).DefaultValue(0.0f)
+            .Tooltip("Vertical nudge for P1's lock-on reticle. Positive = up."));
+    AddWidget(path, "P2 Reticle X Offset: %.1fpx", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.P2.ReticleOffsetX"))
+        .Options(FloatSliderOptions().Format("%.1f").Min(-50.0f).Max(50.0f).DefaultValue(5.0f)
+            .Tooltip("Horizontal nudge for P2's lock-on reticle (corner brackets in "
+                     "the PiP region). Default of 5 matches the previous hardcoded "
+                     "value the corner-bracket code used before this slider existed."));
+    AddWidget(path, "P2 Reticle Y Offset: %.1fpx", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar(CVAR_ENHANCEMENT("LocalCoop.P2.ReticleOffsetY"))
+        .Options(FloatSliderOptions().Format("%.1f").Min(-50.0f).Max(50.0f).DefaultValue(0.0f)
+            .Tooltip("Vertical nudge for P2's lock-on reticle."));
 }
 
 } // namespace SohGui
