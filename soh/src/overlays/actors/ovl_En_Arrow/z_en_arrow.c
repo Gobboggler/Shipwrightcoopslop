@@ -207,7 +207,24 @@ void EnArrow_Destroy(Actor* thisx, PlayState* play) {
 }
 
 void EnArrow_Shoot(EnArrow* this, PlayState* play) {
+    // SoH multiplayer: vanilla used GET_PLAYER (P1) to read unk_A73, the
+    // "just fired this frame" flag set by func_808350A4. When P2 fires,
+    // P2's unk_A73 = 4 but P1's = 0 — arrow checks P1, sees 0, calls
+    // Actor_Kill. Result: ammo depletes but no projectile flies.
+    // Fix: iterate all players, pick whichever one has unk_A73 != 0
+    // (i.e., the one who just fired). Falls back to GET_PLAYER for
+    // single-player parity.
     Player* player = GET_PLAYER(play);
+    {
+        Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        for (; coopP != NULL; coopP = coopP->next) {
+            Player* coopPlayer = (Player*)coopP;
+            if (coopPlayer->unk_A73 != 0) {
+                player = coopPlayer;
+                break;
+            }
+        }
+    }
 
     if (this->actor.parent == NULL) {
         if ((this->actor.params != ARROW_NUT) && (player->unk_A73 == 0)) {
@@ -442,7 +459,21 @@ void func_809B4640(EnArrow* this, PlayState* play) {
 void EnArrow_Update(Actor* thisx, PlayState* play) {
     s32 pad;
     EnArrow* this = (EnArrow*)thisx;
+    // SoH multiplayer: same as EnArrow_Shoot — pick whichever player
+    // appears to have just fired (unk_A73 != 0). Falls back to GET_PLAYER.
+    // The cutscene-block check below uses this player ref; for P2's
+    // arrows we want P2's cutscene state, not P1's.
     Player* player = GET_PLAYER(play);
+    {
+        Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        for (; coopP != NULL; coopP = coopP->next) {
+            Player* coopPlayer = (Player*)coopP;
+            if (coopPlayer->unk_A73 != 0) {
+                player = coopPlayer;
+                break;
+            }
+        }
+    }
 
     if (this->isCsNut || ((this->actor.params >= ARROW_NORMAL_LIT) && (player->unk_A73 != 0)) ||
         !Player_InBlockingCsMode(play, player)) {

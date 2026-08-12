@@ -15,6 +15,40 @@
 #define FAIRY_FLAG_TIMED (1 << 8)
 #define FAIRY_FLAG_BIG (1 << 9)
 
+// SoH multiplayer: P2-Navi marker (0x400 — vetted unused by vanilla).
+#define COOP_FAIRY_FLAG_P2 0x400
+
+extern Actor* gCoopP2NaviActor;
+extern TargetContext gCoopP2TargetCtx;
+
+static Player* EnElf_GetCoopP2(PlayState* play) {
+    Actor* actor = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+    while (actor != NULL) {
+        if (actor->category == ACTORCAT_PLAYER && PLAYER_GET_INDEX(actor) == 1) {
+            return (Player*)actor;
+        }
+        actor = actor->next;
+    }
+    return NULL;
+}
+
+static Player* EnElf_GetOwningPlayer(EnElf* this, PlayState* play) {
+    if (this->fairyFlags & COOP_FAIRY_FLAG_P2) {
+        Player* p2 = EnElf_GetCoopP2(play);
+        if (p2 != NULL) {
+            return p2;
+        }
+    }
+    return GET_PLAYER(play);
+}
+
+static TargetContext* EnElf_GetOwningTargetCtx(EnElf* this, PlayState* play) {
+    if (this->fairyFlags & COOP_FAIRY_FLAG_P2) {
+        return &gCoopP2TargetCtx;
+    }
+    return &play->actorCtx.targetCtx;
+}
+
 void EnElf_Init(Actor* thisx, PlayState* play);
 void EnElf_Destroy(Actor* thisx, PlayState* play);
 void EnElf_Update(Actor* thisx, PlayState* play);
@@ -339,6 +373,16 @@ void EnElf_Init(Actor* thisx, PlayState* play) {
     this->disappearTimer = 600;
     this->unk_2A4 = 0.0f;
     colorConfig = 0;
+
+    // SoH multiplayer: P2-Navi detection. Spawned with params
+    // 0x0100 | FAIRY_NAVI. Strip the 0x100 so the switch hits the
+    // existing FAIRY_NAVI case (skeleton, action, update, naviTimer),
+    // then mark the actor as P2 Navi via COOP_FAIRY_FLAG_P2.
+    s32 coopIsP2Navi = (thisx->params & 0x0100) != 0;
+    if (coopIsP2Navi) {
+        thisx->params &= 0x00FF;
+        this->fairyFlags |= COOP_FAIRY_FLAG_P2;
+    }
 
     switch (thisx->params) {
         case FAIRY_NAVI:
@@ -824,7 +868,9 @@ void EnElf_UpdateLights(EnElf* this, PlayState* play) {
     }
 
     if (this->fairyFlags & 0x20) {
-        player = GET_PLAYER(play);
+        // SoH multiplayer: anchor the talking-state light over the
+        // owning player's head (P1 vanilla, P2 for the P2 Navi).
+        player = EnElf_GetOwningPlayer(this, play);
         Lights_PointNoGlowSetInfo(&this->lightInfoNoGlow, player->actor.world.pos.x,
                                   (s16)(player->actor.world.pos.y) + 60.0f, player->actor.world.pos.z, 255, 255, 255,
                                   200);
@@ -844,7 +890,10 @@ void EnElf_UpdateLights(EnElf* this, PlayState* play) {
 void func_80A03CF8(EnElf* this, PlayState* play) {
     Vec3f nextPos;
     Vec3f prevPos;
-    Player* player = GET_PLAYER(play);
+    // SoH multiplayer: P1 Navi → GET_PLAYER + vanilla targetCtx;
+    // P2 Navi → P2 player + gCoopP2TargetCtx.
+    Player* player = EnElf_GetOwningPlayer(this, play);
+    TargetContext* targetCtx = EnElf_GetOwningTargetCtx(this, play);
     Actor* arrowPointedActor;
     f32 xScale;
     f32 distFromLinksHead;
@@ -940,9 +989,9 @@ void func_80A03CF8(EnElf* this, PlayState* play) {
                 break;
             default:
                 func_80A029A8(this, 1);
-                nextPos = play->actorCtx.targetCtx.naviRefPos;
+                nextPos = targetCtx->naviRefPos;
                 nextPos.y += (1500.0f * this->actor.scale.y);
-                arrowPointedActor = play->actorCtx.targetCtx.arrowPointedActor;
+                arrowPointedActor = targetCtx->arrowPointedActor;
 
                 if (arrowPointedActor != NULL) {
                     func_80A03148(this, &nextPos, 0.0f, 20.0f, 0.2f);
@@ -1005,12 +1054,15 @@ void EnElf_ChangeColor(Color_RGBAf* dest, Color_RGBAf* newColor, Color_RGBAf* cu
 }
 
 void func_80A04414(EnElf* this, PlayState* play) {
-    Actor* arrowPointedActor = play->actorCtx.targetCtx.arrowPointedActor;
-    Player* player = GET_PLAYER(play);
+    // SoH multiplayer: P1 Navi reads vanilla targetCtx; P2 Navi reads
+    // gCoopP2TargetCtx.
+    TargetContext* targetCtx = EnElf_GetOwningTargetCtx(this, play);
+    Player* player = EnElf_GetOwningPlayer(this, play);
+    Actor* arrowPointedActor = targetCtx->arrowPointedActor;
     f32 transitionRate;
     u16 targetSound;
 
-    if (play->actorCtx.targetCtx.unk_40 != 0.0f) {
+    if (targetCtx->unk_40 != 0.0f) {
         this->unk_2C6 = 0;
         this->unk_29C = 1.0f;
 
@@ -1021,18 +1073,43 @@ void func_80A04414(EnElf* this, PlayState* play) {
     } else {
         if (this->unk_2C6 == 0) {
             if ((arrowPointedActor == NULL) ||
-                (Math_Vec3f_DistXYZ(&this->actor.world.pos, &play->actorCtx.targetCtx.naviRefPos) < 50.0f)) {
+                (Math_Vec3f_DistXYZ(&this->actor.world.pos, &targetCtx->naviRefPos) < 50.0f)) {
                 this->unk_2C6 = 1;
             }
         } else if (this->unk_29C != 0.0f) {
+            // SoH multiplayer: outer aura tunic-tint for P2 Navi when
+            // in idle (PLAYER category) color state. Inner color stays
+            // category-meaningful (yellow over enemy, green over NPC).
+            Color_RGBAf coopTargetInner = targetCtx->naviInner;
+            Color_RGBAf coopTargetOuter = targetCtx->naviOuter;
+            if ((this->fairyFlags & COOP_FAIRY_FLAG_P2) &&
+                (targetCtx->activeCategory == ACTORCAT_PLAYER) &&
+                (player != NULL)) {
+                Color_RGB8 coopTunic;
+                s32 coopTunicId = player->currentTunic;
+                if (coopTunicId == PLAYER_TUNIC_GORON) {
+                    Color_RGB8 d = { 0x40, 0x18, 0xA0 };
+                    coopTunic = CVarGetColor24(CVAR_ENHANCEMENT("LocalCoop.P2.GoronTunic.Value"), d);
+                } else if (coopTunicId == PLAYER_TUNIC_ZORA) {
+                    Color_RGB8 d = { 0xE8, 0xC8, 0x30 };
+                    coopTunic = CVarGetColor24(CVAR_ENHANCEMENT("LocalCoop.P2.ZoraTunic.Value"), d);
+                } else {
+                    Color_RGB8 d = { 0xC8, 0x14, 0x14 };
+                    coopTunic = CVarGetColor24(CVAR_ENHANCEMENT("LocalCoop.P2.KokiriTunic.Value"), d);
+                }
+                coopTargetOuter.r = coopTunic.r;
+                coopTargetOuter.g = coopTunic.g;
+                coopTargetOuter.b = coopTunic.b;
+            }
+
             if (Math_StepToF(&this->unk_29C, 0.0f, 0.25f) != 0) {
-                this->innerColor = play->actorCtx.targetCtx.naviInner;
-                this->outerColor = play->actorCtx.targetCtx.naviOuter;
+                this->innerColor = coopTargetInner;
+                this->outerColor = coopTargetOuter;
             } else {
                 transitionRate = 0.25f / this->unk_29C;
-                EnElf_ChangeColor(&this->innerColor, &play->actorCtx.targetCtx.naviInner, &this->innerColor,
+                EnElf_ChangeColor(&this->innerColor, &coopTargetInner, &this->innerColor,
                                   transitionRate);
-                EnElf_ChangeColor(&this->outerColor, &play->actorCtx.targetCtx.naviOuter, &this->outerColor,
+                EnElf_ChangeColor(&this->outerColor, &coopTargetOuter, &this->outerColor,
                                   transitionRate);
             }
         }
@@ -1063,7 +1140,8 @@ void func_80A04414(EnElf* this, PlayState* play) {
 void func_80A0461C(EnElf* this, PlayState* play) {
     s32 temp;
     Actor* arrowPointedActor;
-    Player* player = GET_PLAYER(play);
+    Player* player = EnElf_GetOwningPlayer(this, play);
+    TargetContext* targetCtx = EnElf_GetOwningTargetCtx(this, play);
 
     if (play->csCtx.state != CS_STATE_IDLE) {
         if (play->csCtx.npcActions[8] != NULL) {
@@ -1087,7 +1165,7 @@ void func_80A0461C(EnElf* this, PlayState* play) {
         }
 
     } else {
-        arrowPointedActor = play->actorCtx.targetCtx.arrowPointedActor;
+        arrowPointedActor = targetCtx->arrowPointedActor;
 
         if ((player->stateFlags1 & PLAYER_STATE1_GETTING_ITEM) || ((YREG(15) & 0x10) && Play_CheckViewpoint(play, 2))) {
             temp = 12;
@@ -1373,25 +1451,43 @@ void func_80A052F4(Actor* thisx, PlayState* play) {
 void func_80A053F0(Actor* thisx, PlayState* play) {
     u8 unk2C7;
     s32 pad;
-    Player* player = GET_PLAYER(play);
     EnElf* this = (EnElf*)thisx;
+    Player* player;
+    s32 coopIsP2Navi = (this->fairyFlags & COOP_FAIRY_FLAG_P2) != 0;
 
-    if (player->naviTextId == 0) {
-        if (player->focusActor == NULL) {
-            if (((gSaveContext.naviTimer >= 600) && (gSaveContext.naviTimer <= 3000)) || (nREG(89) != 0)) {
-                player->naviTextId = ElfMessage_GetCUpText(play);
-
-                if (player->naviTextId == 0x15F) {
-                    player->naviTextId = 0;
-                }
-            }
+    // SoH multiplayer: orphan check. If co-op disabled or P2 missing,
+    // self-Kill and clear the global so Player_Update spawns afresh.
+    if (coopIsP2Navi) {
+        Player* coopP2 = EnElf_GetCoopP2(play);
+        if (coopP2 == NULL ||
+            !CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0)) {
+            gCoopP2NaviActor = NULL;
+            Actor_Kill(thisx);
+            return;
         }
-    } else if (player->naviTextId < 0) {
-        // trigger dialog instantly for negative message IDs
-        thisx->flags |= ACTOR_FLAG_TALK_OFFER_AUTO_ACCEPTED;
+        player = coopP2;
+    } else {
+        player = GET_PLAYER(play);
     }
 
-    if (Actor_ProcessTalkRequest(thisx, play)) {
+    if (!coopIsP2Navi) {
+        if (player->naviTextId == 0) {
+            if (player->focusActor == NULL) {
+                if (((gSaveContext.naviTimer >= 600) && (gSaveContext.naviTimer <= 3000)) || (nREG(89) != 0)) {
+                    player->naviTextId = ElfMessage_GetCUpText(play);
+
+                    if (player->naviTextId == 0x15F) {
+                        player->naviTextId = 0;
+                    }
+                }
+            }
+        } else if (player->naviTextId < 0) {
+            // trigger dialog instantly for negative message IDs
+            thisx->flags |= ACTOR_FLAG_TALK_OFFER_AUTO_ACCEPTED;
+        }
+    }
+
+    if (!coopIsP2Navi && Actor_ProcessTalkRequest(thisx, play)) {
         func_800F4524(&gSfxDefaultPos, NA_SE_VO_SK_LAUGH, 0x20);
         thisx->focus.pos = thisx->world.pos;
 
@@ -1504,7 +1600,8 @@ void EnElf_Draw(Actor* thisx, PlayState* play) {
     EnElf* this = (EnElf*)thisx;
     s32 pad1;
     Gfx* dListHead;
-    Player* player = GET_PLAYER(play);
+    // SoH multiplayer: hide based on owning player's first-person state.
+    Player* player = EnElf_GetOwningPlayer(this, play);
 
     if ((this->unk_2A8 != 8) && !(this->fairyFlags & 8)) {
         if (!(player->stateFlags1 & PLAYER_STATE1_FIRST_PERSON) || (kREG(90) < this->actor.projectedPos.z)) {

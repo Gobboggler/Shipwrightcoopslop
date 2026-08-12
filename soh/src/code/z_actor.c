@@ -489,6 +489,18 @@ void func_8002C124(TargetContext* targetCtx, PlayState* play) {
         spBC.y = (120 * (spBC.y * spB4)) * var1;
         spBC.y = CLAMP(spBC.y, -240.0f, 240.0f);
 
+        // SoH multiplayer: previously this point had a "bleed
+        // prevention" hack that gated drawing on spBC.x > -80.0f when
+        // co-op was on, intended to keep P1's spinning reticle from
+        // poking into P2's PiP region. After the PiP refactor (view
+        // restored to full-screen before Interface_Draw runs and calls
+        // this function) that gate was firing on every centered target
+        // — a P1 target at screen center has spBC.x = 0, which IS
+        // greater than -80, so the gate killed P1's reticle entirely
+        // in co-op mode. Removed. The PiP region is rendered as a
+        // separate draw pass with its own viewport, so the main-pass
+        // reticle no longer needs gating.
+
         spBC.z = spBC.z * var1;
 
         targetCtx->unk_4C--;
@@ -556,6 +568,114 @@ void func_8002C124(TargetContext* targetCtx, PlayState* play) {
     }
 
     CLOSE_DISPS(play->state.gfxCtx);
+}
+
+// SoH multiplayer: drive gCoopP2TargetCtx for P2's Navi / reticle.
+// Mirrors func_8002C7BC but uses Coop_FindTargetForPlayer (caller-
+// relative). Called from Actor_UpdateAll right after the vanilla
+// update, gated on LocalCoop.Enabled.
+extern TargetContext gCoopP2TargetCtx;
+void Coop_UpdateP2TargetCtx(Player* p2, Actor* p2FocusActor, PlayState* play) {
+    TargetContext* targetCtx = &gCoopP2TargetCtx;
+    Actor* unkActor;
+    s32 actorCategory;
+    Vec3f sp50;
+    f32 sp4C;
+    f32 temp1, temp2, temp3, temp4, temp5, temp6;
+    s32 lockOnSfxId;
+
+    unkActor = NULL;
+
+    if ((p2->focusActor != NULL) && (p2->controlStickDirections[p2->controlStickDataIndex] == 2)) {
+        targetCtx->unk_94 = NULL;
+    } else {
+        unkActor = Coop_FindTargetForPlayer(play, &play->actorCtx, p2);
+        targetCtx->unk_94 = unkActor;
+    }
+
+    if (targetCtx->unk_8C != NULL) {
+        unkActor = targetCtx->unk_8C;
+        targetCtx->unk_8C = NULL;
+    } else if (p2FocusActor != NULL) {
+        unkActor = p2FocusActor;
+    }
+
+    if (unkActor != NULL) {
+        actorCategory = unkActor->category;
+    } else {
+        actorCategory = p2->actor.category;
+    }
+
+    if ((unkActor != targetCtx->arrowPointedActor) || (actorCategory != targetCtx->activeCategory)) {
+        targetCtx->arrowPointedActor = unkActor;
+        targetCtx->activeCategory = actorCategory;
+        targetCtx->unk_40 = 1.0f;
+    }
+
+    if (unkActor == NULL) {
+        unkActor = &p2->actor;
+    }
+
+    if (Math_StepToF(&targetCtx->unk_40, 0.0f, 0.25f) == 0) {
+        temp1 = 0.25f / targetCtx->unk_40;
+        temp2 = unkActor->world.pos.x - targetCtx->naviRefPos.x;
+        temp3 = (unkActor->world.pos.y + (unkActor->targetArrowOffset * unkActor->scale.y)) - targetCtx->naviRefPos.y;
+        temp4 = unkActor->world.pos.z - targetCtx->naviRefPos.z;
+        targetCtx->naviRefPos.x += temp2 * temp1;
+        targetCtx->naviRefPos.y += temp3 * temp1;
+        targetCtx->naviRefPos.z += temp4 * temp1;
+    } else {
+        func_8002BF60(targetCtx, unkActor, actorCategory, play);
+    }
+
+    if ((p2FocusActor != NULL) && (targetCtx->unk_4B == 0)) {
+        func_8002BE04(play, &p2FocusActor->focus.pos, &sp50, &sp4C);
+        if (((sp50.z <= 0.0f) || (1.0f <= fabsf(sp50.x * sp4C))) || (1.0f <= fabsf(sp50.y * sp4C))) {
+            p2FocusActor = NULL;
+        }
+    }
+
+    if (p2FocusActor != NULL) {
+        if (p2FocusActor != targetCtx->targetedActor) {
+            func_8002BE98(targetCtx, p2FocusActor->category, play);
+            targetCtx->targetedActor = p2FocusActor;
+
+            if (p2FocusActor->id == ACTOR_EN_BOOM) {
+                targetCtx->unk_48 = 0;
+            }
+
+            lockOnSfxId = CHECK_FLAG_ALL(p2FocusActor->flags, ACTOR_FLAG_ATTENTION_ENABLED | ACTOR_FLAG_HOSTILE)
+                              ? NA_SE_SY_LOCK_ON
+                              : NA_SE_SY_LOCK_ON_HUMAN;
+            {
+                static s32 sCoopP2LastLockSoundFrame = -1000;
+                s32 coopCurrentFrame = play->state.frames;
+                if ((coopCurrentFrame - sCoopP2LastLockSoundFrame) > 30 ||
+                    (coopCurrentFrame < sCoopP2LastLockSoundFrame)) {
+                    sCoopP2LastLockSoundFrame = coopCurrentFrame;
+                    Sfx_PlaySfxCentered(lockOnSfxId);
+                }
+            }
+        }
+
+        targetCtx->targetCenterPos.x = p2FocusActor->world.pos.x;
+        targetCtx->targetCenterPos.y = p2FocusActor->world.pos.y - (p2FocusActor->shape.yOffset * p2FocusActor->scale.y);
+        targetCtx->targetCenterPos.z = p2FocusActor->world.pos.z;
+
+        if (targetCtx->unk_4B == 0) {
+            temp5 = (500.0f - targetCtx->unk_44) * 3.0f;
+            temp6 = (temp5 < 30.0f) ? 30.0f : ((100.0f < temp5) ? 100.0f : temp5);
+            if (Math_StepToF(&targetCtx->unk_44, 80.0f, temp6) != 0) {
+                targetCtx->unk_4B++;
+            }
+        } else {
+            targetCtx->unk_4B = (targetCtx->unk_4B + 3) | 0x80;
+            targetCtx->unk_44 = 120.0f;
+        }
+    } else {
+        targetCtx->targetedActor = NULL;
+        Math_StepToF(&targetCtx->unk_44, 500.0f, 80.0f);
+    }
 }
 
 void func_8002C7BC(TargetContext* targetCtx, Player* player, Actor* actorArg, PlayState* play) {
@@ -635,7 +755,23 @@ void func_8002C7BC(TargetContext* targetCtx, Player* player, Actor* actorArg, Pl
             lockOnSfxId = CHECK_FLAG_ALL(actorArg->flags, ACTOR_FLAG_ATTENTION_ENABLED | ACTOR_FLAG_HOSTILE)
                               ? NA_SE_SY_LOCK_ON
                               : NA_SE_SY_LOCK_ON_HUMAN;
-            Sfx_PlaySfxCentered(lockOnSfxId);
+            // SoH multiplayer: throttle lock-on sound to prevent spam when
+            // P2's movement causes the "best target" to flip between actors.
+            // Without this, holding Z while P2 wanders near enemies fires
+            // the sound every frame as the closest-target rotation changes.
+            // 30-frame minimum gap between plays = ~0.5s at 60fps.
+            {
+                static s32 sCoopLastLockSoundFrame = -1000;
+                s32 coopThrottleActive =
+                    CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0);
+                s32 coopCurrentFrame = play->state.frames;
+                if (!coopThrottleActive ||
+                    (coopCurrentFrame - sCoopLastLockSoundFrame) > 30 ||
+                    (coopCurrentFrame < sCoopLastLockSoundFrame)) {
+                    sCoopLastLockSoundFrame = coopCurrentFrame;
+                    Sfx_PlaySfxCentered(lockOnSfxId);
+                }
+            }
         }
 
         targetCtx->targetCenterPos.x = actorArg->world.pos.x;
@@ -2110,7 +2246,25 @@ s32 GiveItemEntryFromActorWithFixedRange(Actor* actor, PlayState* play, GetItemE
 
 // If you're doing something for randomizer, you're probably looking for GiveItemEntryFromActor
 s32 Actor_OfferGetItem(Actor* actor, PlayState* play, s32 getItemId, f32 xzRange, f32 yRange) {
-    Player* player = GET_PLAYER(play);
+    // SoH multiplayer: offer the item to whichever Player is closest.
+    Player* nearest = NULL;
+    f32 nearestDistSq = SQ(xzRange) + SQ(yRange);
+    Actor* p = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+    for (; p != NULL; p = p->next) {
+        f32 dx = actor->world.pos.x - p->world.pos.x;
+        f32 dz = actor->world.pos.z - p->world.pos.z;
+        f32 dy = actor->world.pos.y - p->world.pos.y;
+        f32 distSq = SQ(dx) + SQ(dz) + SQ(dy);
+        if (distSq < nearestDistSq) {
+            nearestDistSq = distSq;
+            nearest = (Player*)p;
+        }
+    }
+    if (nearest == NULL) {
+        return false;
+    }
+
+    Player* player = nearest;
 
     if (!(player->stateFlags1 &
           (PLAYER_STATE1_DEAD | PLAYER_STATE1_CHARGING_SPIN_ATTACK | PLAYER_STATE1_HANGING_OFF_LEDGE |
@@ -2121,8 +2275,12 @@ s32 Actor_OfferGetItem(Actor* actor, PlayState* play, s32 getItemId, f32 xzRange
              ((!IS_RANDO && ((getItemId > GI_NONE) && (getItemId < GI_MAX))) ||
               (IS_RANDO && ((getItemId > RG_NONE) && (getItemId < RG_MAX))))) ||
             (!(player->stateFlags1 & (PLAYER_STATE1_CARRYING_ACTOR | PLAYER_STATE1_IN_CUTSCENE)))) {
-            if ((actor->xzDistToPlayer < xzRange) && (fabsf(actor->yDistToPlayer) < yRange)) {
-                s16 yawDiff = actor->yawTowardsPlayer - player->actor.shape.rot.y;
+
+            f32 actorXZDist = Actor_WorldDistXZToActor(actor, &player->actor);
+            f32 actorYDist  = Actor_HeightDiff(actor, &player->actor);
+
+            if ((actorXZDist < xzRange) && (fabsf(actorYDist) < yRange)) {
+                s16 yawDiff = Actor_WorldYawTowardActor(actor, &player->actor) - player->actor.shape.rot.y;
                 s32 absYawDiff = ABS(yawDiff);
 
                 if ((getItemId != GI_NONE) || (player->getItemDirection < absYawDiff)) {
@@ -2662,11 +2820,64 @@ void Actor_UpdateAll(PlayState* play, ActorContext* actorCtx) {
                 }
             } else {
                 Math_Vec3f_Copy(&actor->prevPos, &actor->world.pos);
-                actor->xzDistToPlayer = Actor_WorldDistXZToActor(actor, &player->actor);
-                actor->yDistToPlayer = Actor_HeightDiff(actor, &player->actor);
-                actor->xyzDistToPlayerSq = SQ(actor->xzDistToPlayer) + SQ(actor->yDistToPlayer);
+                {
+                    // SoH multiplayer: pick whichever player is closer for
+                    // distance/yaw fields so AI/enemies react to BOTH Links.
+                    // Without this, enemies only acknowledge P1.
+                    // Defensive: skip candidates with NaN positions, and don't
+                    // run the math at all if either side has NaN — atan2
+                    // propagates NaN into a table-lookup index and crashes.
+                    Actor* coopNearest = &player->actor;
+                    f32 coopDist = Actor_WorldDistXYZToActor(actor, &player->actor);
+                    f32 coopNearestDistSq = (coopDist == coopDist) ? SQ(coopDist) : 3.4e38f;
 
-                actor->yawTowardsPlayer = Actor_WorldYawTowardActor(actor, &player->actor);
+                    if (actor->category != ACTORCAT_PLAYER &&
+                        actor->world.pos.x == actor->world.pos.x &&
+                        actor->world.pos.y == actor->world.pos.y &&
+                        actor->world.pos.z == actor->world.pos.z) {
+                        Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+                        for (; coopP != NULL; coopP = coopP->next) { if (coopP->category != ACTORCAT_PLAYER || PLAYER_GET_INDEX(coopP) == 0) continue;
+                            if (coopP->world.pos.x != coopP->world.pos.x) continue;
+                            if (coopP->world.pos.y != coopP->world.pos.y) continue;
+                            if (coopP->world.pos.z != coopP->world.pos.z) continue;
+                            f32 d = Actor_WorldDistXYZToActor(actor, coopP);
+                            if (SQ(d) < coopNearestDistSq) {
+                                coopNearestDistSq = SQ(d);
+                                coopNearest = coopP;
+                            }
+                        }
+                    }
+
+                    if (actor->world.pos.x == actor->world.pos.x &&
+                        actor->world.pos.y == actor->world.pos.y &&
+                        actor->world.pos.z == actor->world.pos.z &&
+                        coopNearest->world.pos.x == coopNearest->world.pos.x &&
+                        coopNearest->world.pos.y == coopNearest->world.pos.y &&
+                        coopNearest->world.pos.z == coopNearest->world.pos.z) {
+                        actor->xzDistToPlayer = Actor_WorldDistXZToActor(actor, coopNearest);
+                        actor->yDistToPlayer = Actor_HeightDiff(actor, coopNearest);
+                        actor->xyzDistToPlayerSq = SQ(actor->xzDistToPlayer) + SQ(actor->yDistToPlayer);
+                        actor->yawTowardsPlayer = Actor_WorldYawTowardActor(actor, coopNearest);
+                    }
+
+                    // SoH multiplayer: same keepalive as Actor_DrawAll —
+                    // force INSIDE_CULLING_VOLUME if ANY player is within
+                    // range. Actor_DrawAll runs AFTER Actor_UpdateAll, so
+                    // its keepalive only sets the flag for the next frame's
+                    // update. Without setting it here too, there's a one-
+                    // frame window where P1 turns the camera away from an
+                    // actor P2 is interacting with → vanilla culling cleared
+                    // the flag last frame → this frame's update gate sees
+                    // it clear and skips the actor's update entirely → the
+                    // actor freezes mid-action in P2's view. Setting the
+                    // flag here closes that window so the actor stays
+                    // alive for whichever player is near it. Must live
+                    // inside the same block as coopNearestDistSq.
+                    if (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0) &&
+                        (coopNearestDistSq < SQ(4000.0f))) {
+                        actor->flags |= ACTOR_FLAG_INSIDE_CULLING_VOLUME;
+                    }
+                }
                 actor->flags &= ~ACTOR_FLAG_SFX_FOR_PLAYER_BODY_HIT;
 
                 if ((DECR(actor->freezeTimer) == 0) &&
@@ -2677,8 +2888,37 @@ void Actor_UpdateAll(PlayState* play, ActorContext* actorCtx) {
                         actor->isTargeted = false;
                     }
 
-                    if ((actor->targetPriority != 0) && (player->focusActor == NULL)) {
-                        actor->targetPriority = 0;
+                    // SoH multiplayer: priority reset must consider
+                    // BOTH players' focusActors. P2 sets a target's
+                    // priority to 40 when locking on (z_player.c line
+                    // ~4085 of Player_UpdateZTargeting). The vanilla
+                    // cleanup here only resets priority when P1's
+                    // focus is NULL — so P2's stale 40 sticks around
+                    // forever after P2 releases, biasing P1's reticle
+                    // hover and func_80032AF0 cycle order toward
+                    // whatever P2 last locked onto. This was a
+                    // primary cause of "P1's lock-on logic breaks
+                    // when P2 disengages": the stale priority made
+                    // P1's reticle cycle / Navi hover land on the
+                    // wrong target.
+                    //
+                    // Fix: walk all player actors and check if ANY
+                    // of them currently focuses this actor. Only
+                    // reset priority when none do.
+                    if (actor->targetPriority != 0) {
+                        s32 coopAnyPlayerFocused = 0;
+                        Actor* coopPiter = actorCtx->actorLists[ACTORCAT_PLAYER].head;
+                        while (coopPiter != NULL) {
+                            if (coopPiter->category == ACTORCAT_PLAYER &&
+                                ((Player*)coopPiter)->focusActor == actor) {
+                                coopAnyPlayerFocused = 1;
+                                break;
+                            }
+                            coopPiter = coopPiter->next;
+                        }
+                        if (!coopAnyPlayerFocused) {
+                            actor->targetPriority = 0;
+                        }
                     }
 
                     Actor_SetObjectDependency(play, actor);
@@ -2719,6 +2959,31 @@ void Actor_UpdateAll(PlayState* play, ActorContext* actorCtx) {
     }
 
     func_8002C7BC(&actorCtx->targetCtx, player, actor, play);
+
+    // SoH multiplayer: drive gCoopP2TargetCtx for P2's Navi / reticle.
+    // Walks the player list to find P2; if alive and co-op enabled,
+    // derive its focusActor and run per-player target update. Without
+    // this, P2's TargetContext stays stale and Navi has nothing to
+    // hover over.
+    if (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0)) {
+        Actor* coopP = actorCtx->actorLists[ACTORCAT_PLAYER].head;
+        while (coopP != NULL) {
+            if (coopP->category == ACTORCAT_PLAYER && PLAYER_GET_INDEX(coopP) == 1) {
+                Player* p2 = (Player*)coopP;
+                Actor* p2Focus = p2->focusActor;
+                if ((p2Focus != NULL) && (p2Focus->update == NULL)) {
+                    p2Focus = NULL;
+                    Player_ReleaseLockOn(p2);
+                }
+                if ((p2Focus == NULL) || (p2->zTargetActiveTimer < 5)) {
+                    p2Focus = NULL;
+                }
+                Coop_UpdateP2TargetCtx(p2, p2Focus, play);
+                break;
+            }
+            coopP = coopP->next;
+        }
+    }
     TitleCard_Update(play, &actorCtx->titleCtx);
     DynaPoly_UpdateBgActorTransforms(play, &play->colCtx.dyna);
 }
@@ -3092,6 +3357,97 @@ void func_800315AC(PlayState* play, ActorContext* actorCtx) {
                         actor->flags &= ~ACTOR_FLAG_INSIDE_CULLING_VOLUME;
                     }
                 }
+
+                // SoH multiplayer: above branches set/clear the flag
+                // based on P1's view-projection. In co-op, P2 has its
+                // own camera and we want actors visible to P2 to keep
+                // updating/drawing when P1 looks away. Without this,
+                // P2 sees enemies and NPCs vanish, doors and switches
+                // go unresponsive — anything depending on Actor_
+                // UpdateAll's culling gate at line 2885.
+                //
+                // Two-layer approach:
+                //   1) Run the same culling test against P2's view-
+                //      projection matrix (staged by z_play.c PiP block)
+                //   2) Belt-and-suspenders: also set the flag when
+                //      EITHER player is within a generous world-space
+                //      distance of the actor. Vanilla frustum tests
+                //      can be too aggressive at the screen edges and
+                //      certain actor classes have their own custom
+                //      distance-to-camera gates inside their update
+                //      functions — the distance keepalive guarantees
+                //      they stay live regardless of frustum math.
+                //
+                // No more LocalCoop.PiPPrototype gate — the previous
+                // version required THREE CVars to align before the
+                // P2 path ran, which silently disabled the fix when
+                // a user had Enabled+split-screen but PiPPrototype
+                // wasn't on (since PiPPrototype defaults to 0).
+                //
+                // NOTE: externs are declared at block scope here
+                // rather than via a GCC statement-expression — MSVC
+                // (Windows CI) doesn't accept `({ ... })`.
+                extern s32 gCoopP2ReticleValid;
+                extern MtxF gCoopP2ViewProjMtxF;
+                if (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0)) {
+                    // Layer 1: P2 frustum test (only if matrix staged).
+                    if (gCoopP2ReticleValid) {
+                        Vec3f coopCullProjPos;
+                        f32 coopCullProjW;
+                        SkinMatrix_Vec3fMtxFMultXYZW(&gCoopP2ViewProjMtxF,
+                                                     &actor->world.pos,
+                                                     &coopCullProjPos,
+                                                     &coopCullProjW);
+                        if (CVarGetInteger(CVAR_ENHANCEMENT("DisableDrawDistance"), 1) > 1 ||
+                            CVarGetInteger(CVAR_ENHANCEMENT("WidescreenActorCulling"), 0)) {
+                            bool coopP2ShouldDraw = false;
+                            bool coopP2ShouldUpdate = false;
+                            Ship_CalcShouldDrawAndUpdate(play, actor,
+                                                         &coopCullProjPos,
+                                                         coopCullProjW,
+                                                         &coopP2ShouldDraw,
+                                                         &coopP2ShouldUpdate);
+                            if (coopP2ShouldUpdate) {
+                                actor->flags |= ACTOR_FLAG_INSIDE_CULLING_VOLUME;
+                            }
+                            if (coopP2ShouldDraw) {
+                                shipShouldDraw = true;
+                            }
+                        } else {
+                            if (func_800314D4(play, actor,
+                                              &coopCullProjPos,
+                                              coopCullProjW)) {
+                                actor->flags |= ACTOR_FLAG_INSIDE_CULLING_VOLUME;
+                                shipShouldDraw = true;
+                            }
+                        }
+                    }
+
+                    // Layer 2: world-space distance keepalive. If
+                    // EITHER player is within 4000 units (xz) of the
+                    // actor, force INSIDE_CULLING_VOLUME on. This
+                    // covers actors whose own update functions do
+                    // distance checks against projectedPos.z (which
+                    // is only computed against P1's matrix) and
+                    // would otherwise go dormant when P1 looks away.
+                    //
+                    // 4000 units ≈ 40 in-game meters, generous enough
+                    // to keep dungeon rooms / overworld locales alive
+                    // for whichever player is in them but tight
+                    // enough to not waste perf on far-away actors.
+                    Actor* coopPlayerIter = actorCtx->actorLists[ACTORCAT_PLAYER].head;
+                    while (coopPlayerIter != NULL) {
+                        if (coopPlayerIter->category == ACTORCAT_PLAYER) {
+                            f32 ddx = actor->world.pos.x - coopPlayerIter->world.pos.x;
+                            f32 ddz = actor->world.pos.z - coopPlayerIter->world.pos.z;
+                            if (ddx * ddx + ddz * ddz < SQ(4000.0f)) {
+                                actor->flags |= ACTOR_FLAG_INSIDE_CULLING_VOLUME;
+                                break;
+                            }
+                        }
+                        coopPlayerIter = coopPlayerIter->next;
+                    }
+                }
             }
 
             actor->isDrawn = false;
@@ -3250,6 +3606,19 @@ void Actor_AddToCategory(ActorContext* actorCtx, Actor* actorToAdd, u8 actorCate
     actorCtx->total++;
     actorCtx->actorLists[actorCategory].length++;
     prevHead = actorCtx->actorLists[actorCategory].head;
+
+    // SoH multiplayer: keep the primary Player as list head so GET_PLAYER
+    // continues to return P1. Additional players append to tail.
+    if (actorCategory == ACTORCAT_PLAYER && prevHead != NULL) {
+        Actor* tail = prevHead;
+        while (tail->next != NULL) {
+            tail = tail->next;
+        }
+        tail->next = actorToAdd;
+        actorToAdd->prev = tail;
+        actorToAdd->next = NULL;
+        return;
+    }
 
     if (prevHead != NULL) {
         prevHead->prev = actorToAdd;
@@ -3491,9 +3860,27 @@ Actor* Actor_Delete(ActorContext* actorCtx, Actor* actor, PlayState* play) {
     // Execute before actor memory is freed
     GameInteractor_ExecuteOnActorDestroy(actor);
 
-    if ((player != NULL) && (actor == player->focusActor)) {
-        Player_ReleaseLockOn(player);
-        Camera_ChangeMode(Play_GetCamera(play, Play_GetActiveCamId(play)), 0);
+    // SoH multiplayer: clean up focusActor on EVERY player whose lock-on
+    // points at the dying actor, not just GET_PLAYER (P1). Without this,
+    // P2's focusActor could dangle to freed memory after their locked
+    // target dies — silent corruption that would crash next frame when
+    // vanilla camera/combat code dereferences it.
+    {
+        Actor* coopP = actorCtx->actorLists[ACTORCAT_PLAYER].head;
+        for (; coopP != NULL; coopP = coopP->next) {
+            Player* coopPlayer = (Player*)coopP;
+            if (actor == coopPlayer->focusActor) {
+                Player_ReleaseLockOn(coopPlayer);
+                // For P1 this also resets the camera mode; for P2 the
+                // active-camera invariant is only true during P2's
+                // own update, so we skip the Camera_ChangeMode here.
+                // Vanilla Player_UpdateCommon will re-enter NORMAL mode
+                // on the next frame when focusActor is observed NULL.
+                if (coopPlayer == player) {
+                    Camera_ChangeMode(Play_GetCamera(play, Play_GetActiveCamId(play)), 0);
+                }
+            }
+        }
     }
 
     if (actor == actorCtx->targetCtx.arrowPointedActor) {
@@ -3601,6 +3988,144 @@ u8 D_801160A0[] = {
     ACTORCAT_BOSS,  ACTORCAT_ENEMY,  ACTORCAT_BG,   ACTORCAT_EXPLOSIVE, ACTORCAT_NPC,  ACTORCAT_ITEMACTION,
     ACTORCAT_CHEST, ACTORCAT_SWITCH, ACTORCAT_PROP, ACTORCAT_MISC,      ACTORCAT_DOOR, ACTORCAT_SWITCH,
 };
+
+// SoH multiplayer: per-player target search for P2 lock-on.
+//
+// Why this exists: vanilla `func_80032AF0` reads actor->xyzDistToPlayerSq
+// and actor->yawTowardsPlayer (set in Actor_UpdateAll). The co-op patch
+// here updates those fields to be relative to the NEAREST player so
+// enemy AI reacts to both Links — but that means when P2 calls
+// func_80032AF0, the per-actor cached distance/yaw fields are NOT
+// guaranteed to be P2-relative. For any actor that's closer to P1 than
+// to P2, the cached values are P1-relative, so the cone test compares
+// against the wrong reference and the distance is the actor's distance
+// to P1.
+//
+// Net symptom for the user: P2 can only lock onto actors near P1. Fix
+// is to recompute distance and yaw fresh from `caller` to each
+// candidate, and run the full vanilla filter set against those fresh
+// values. Filter structure mirrors vanilla `func_800328D4` so the
+// per-target-mode lock-on ranges, priority tie-breaking, and line-of-
+// sight checks all behave identically — just anchored to the caller.
+Actor* Coop_FindTargetForPlayer(PlayState* play, ActorContext* actorCtx, Player* caller) {
+    static const u8 sCoopPriCats[] = {
+        ACTORCAT_BOSS,  ACTORCAT_ENEMY,  ACTORCAT_BG,   ACTORCAT_EXPLOSIVE, ACTORCAT_NPC,  ACTORCAT_ITEMACTION,
+        ACTORCAT_CHEST, ACTORCAT_SWITCH, ACTORCAT_PROP, ACTORCAT_MISC,      ACTORCAT_DOOR, ACTORCAT_SWITCH,
+    };
+    Actor* bestNormal = NULL;
+    Actor* bestPriority = NULL;
+    f32 bestScore = FLT_MAX;
+    s32 bestPriorityVal = 0x7FFFFFFF;
+    s16 callerFacing = caller->actor.shape.rot.y;
+    s32 catIdx;
+    s32 catCount;
+    s32 lookedHard = false;
+
+    if (Player_InCsMode(play)) {
+        return NULL;
+    }
+    if (caller->actor.world.pos.x != caller->actor.world.pos.x ||
+        caller->actor.world.pos.y != caller->actor.world.pos.y ||
+        caller->actor.world.pos.z != caller->actor.world.pos.z) {
+        return NULL;
+    }
+
+    for (catCount = 3, catIdx = 0; catIdx < catCount; catIdx++) {
+        u32 actorCategory = sCoopPriCats[catIdx];
+        Actor* actor = actorCtx->actorLists[actorCategory].head;
+
+        while (actor != NULL) {
+            if ((actor->update == NULL) || (actor == &caller->actor) ||
+                (actor->category == ACTORCAT_PLAYER) ||
+                !CHECK_FLAG_ALL(actor->flags, ACTOR_FLAG_ATTENTION_ENABLED) ||
+                (actor->flags & ACTOR_FLAG_LOCK_ON_DISABLED) ||
+                (actor == caller->focusActor)) {
+                actor = actor->next;
+                continue;
+            }
+            if (actor->world.pos.x != actor->world.pos.x ||
+                actor->world.pos.y != actor->world.pos.y ||
+                actor->world.pos.z != actor->world.pos.z) {
+                actor = actor->next;
+                continue;
+            }
+
+            f32 dx = actor->world.pos.x - caller->actor.world.pos.x;
+            // SoH multiplayer: previous version used actor->focus.pos.y
+            // and caller->actor.focus.pos.y here, which biased the Y
+            // delta by (actor_head_height - player_head_height). For
+            // a player vs a short enemy at the same world Y, the focus-
+            // pos delta would be ~+60 even though world Y is identical
+            // — making the actor appear "farther" than vanilla's
+            // xyzDistToPlayerSq calculation would, and pushing
+            // marginal-range targets out of the cone gate. Vanilla
+            // Actor_UpdateAll uses Actor_HeightDiff which is plain
+            // world.pos.y - world.pos.y. Match that so the find range
+            // for P2 is the same as vanilla's find range for P1.
+            f32 dy = actor->world.pos.y - caller->actor.world.pos.y;
+            f32 dz = actor->world.pos.z - caller->actor.world.pos.z;
+            f32 distXyzSq = dx * dx + dy * dy + dz * dz;
+
+            if (distXyzSq >= D_80115FF8[actor->targetMode].rangeSq) {
+                actor = actor->next;
+                continue;
+            }
+
+            s16 yawCallerToActor = Math_Atan2S(dz, dx);
+            s16 yawDelta = yawCallerToActor - callerFacing;
+            s16 yawAbs = ABS(yawDelta);
+
+            s16 coneThreshold = (caller->focusActor != NULL) ? 0x4000 : 0x2AAA;
+            if (yawAbs > coneThreshold) {
+                actor = actor->next;
+                continue;
+            }
+
+            CollisionPoly* hitPoly;
+            s32 hitBgId;
+            Vec3f hitPos;
+            if (BgCheck_CameraLineTest1(&play->colCtx,
+                                        &caller->actor.focus.pos,
+                                        &actor->focus.pos,
+                                        &hitPos, &hitPoly,
+                                        1, 1, 1, 1, &hitBgId) &&
+                !SurfaceType_IsIgnoredByProjectiles(&play->colCtx, hitPoly, hitBgId)) {
+                actor = actor->next;
+                continue;
+            }
+
+            f32 score = distXyzSq - distXyzSq * 0.8f *
+                        ((0x4000 - yawAbs) * (1.0f / 0x8000));
+
+            if (actor->targetPriority != 0) {
+                if (actor->targetPriority < bestPriorityVal) {
+                    bestPriorityVal = actor->targetPriority;
+                    bestPriority = actor;
+                }
+            } else {
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestNormal = actor;
+                }
+            }
+
+            actor = actor->next;
+        }
+
+        if (catIdx == 2 && (bestNormal != NULL || bestPriority != NULL)) {
+            break;
+        }
+        if (catIdx == 2 && !lookedHard) {
+            lookedHard = true;
+            catCount = ARRAY_COUNT(sCoopPriCats);
+        }
+    }
+
+    if (bestPriority != NULL) {
+        return bestPriority;
+    }
+    return bestNormal;
+}
 
 Actor* func_80032AF0(PlayState* play, ActorContext* actorCtx, Actor** actorPtr, Player* player) {
     s32 i;
@@ -4614,7 +5139,30 @@ s16 Actor_UpdateAlphaByDistance(Actor* actor, PlayState* play, s16 alpha, f32 ra
     if ((play->csCtx.state != CS_STATE_IDLE) || (gDbgCamEnabled)) {
         distance = Math_Vec3f_DistXYZ(&actor->world.pos, &play->view.eye) * 0.25f;
     } else {
+        // SoH multiplayer: use NEAREST player's distance for the
+        // ATTENTION_ENABLED toggle. Vanilla used only GET_PLAYER (P1)
+        // — meaning when P1 walked outside an NPC/enemy's attention
+        // radius, ACTOR_FLAG_ATTENTION_ENABLED got cleared, and
+        // func_8002F0C8 would then "release lock" for BOTH P1 and P2
+        // since the actor stopped accepting attention. Symptom: lock-
+        // on range felt tiny — a few steps from the target snapped
+        // the lock off for both players. By checking nearest player,
+        // the flag stays on as long as either Link is within radius.
         distance = Math_Vec3f_DistXYZ(&actor->world.pos, &player->actor.world.pos);
+        Actor* coopPiter = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        while (coopPiter != NULL) {
+            if (coopPiter->category == ACTORCAT_PLAYER && PLAYER_GET_INDEX(coopPiter) != 0) {
+                if (coopPiter->world.pos.x == coopPiter->world.pos.x &&
+                    coopPiter->world.pos.y == coopPiter->world.pos.y &&
+                    coopPiter->world.pos.z == coopPiter->world.pos.z) {
+                    f32 coopD = Math_Vec3f_DistXYZ(&actor->world.pos, &coopPiter->world.pos);
+                    if (coopD < distance) {
+                        distance = coopD;
+                    }
+                }
+            }
+            coopPiter = coopPiter->next;
+        }
     }
 
     if (radius < distance) {

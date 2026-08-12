@@ -455,6 +455,28 @@ void Player_SetBootData(PlayState* play, Player* this) {
     s32 currentBoots;
     s16* bootRegs;
 
+    // SoH multiplayer: SKIP for P2. This function writes physics
+    // constants to GLOBAL REG/IREG variables (jump heights, run
+    // speeds, deceleration, etc.) based on the current player's boots
+    // AND in-water state. Running it for both players means whichever
+    // updates LAST (P2, since P1 updates first) overwrites the IREGs,
+    // and P1's next jump/run reads P2's values. Concrete reproducer:
+    // P2 in water → P2's currentBoots resolves to BOOTS_IRON_UNDERWATER
+    // (or just KOKIRI but with reduced regs from the water gate),
+    // IREGs end up with low-jump values, and the next time P1 presses
+    // A to jump (with their own actual boots / not in water) they do
+    // the short underwater hop instead of a normal roll-jump.
+    //
+    // The IREGs are read-only from the physics path — they don't get
+    // written per-player-instance, just per-frame globally. So the
+    // fix is: let P1's update own them, P2's update no-ops here. P2's
+    // jump physics will use P1's boot data, which is correct for the
+    // common case (P1 and P2 share inventory in our co-op, so their
+    // boots match).
+    if (PLAYER_GET_INDEX(&this->actor) != 0) {
+        return;
+    }
+
     REG(27) = 2000;
     REG(48) = 370;
 
@@ -744,8 +766,8 @@ void Player_SetAutoLockOnActor(PlayState* play, Actor* actor) {
     this->focusActor = actor;
     this->autoLockOnActor = actor;
     this->stateFlags1 |= PLAYER_STATE1_FRIENDLY_ACTOR_FOCUS;
-    Camera_SetParam(Play_GetCamera(play, 0), 8, actor);
-    Camera_ChangeMode(Play_GetCamera(play, 0), 2);
+    Camera_SetParam(Play_GetCamera(play, SUBCAM_ACTIVE), 8, actor);
+    Camera_ChangeMode(Play_GetCamera(play, SUBCAM_ACTIVE), 2);
 }
 
 s32 func_8008EF30(PlayState* play) {
@@ -1077,6 +1099,30 @@ void Player_DrawImpl(PlayState* play, void** skeleton, Vec3s* jointTable, s32 dL
         color = &sTemp;
     }
 
+    // SoH multiplayer: when drawing a secondary player, override the tunic
+    // color with the P2-specific palette. `data` is the Player pointer (passed
+    // as `this` from Player_Draw); we sanity-check it's actually a player
+    // actor before reading PLAYER_GET_INDEX. Defaults match the menu defaults
+    // (red Kokiri, purple Goron, gold Zora). Picker UI lives in
+    // SohMenuEnhancements.cpp under the "Local Co-op" sidebar entry.
+    if (data != NULL && ((Player*)data)->actor.id == ACTOR_PLAYER &&
+        PLAYER_GET_INDEX(&((Player*)data)->actor) != 0) {
+        Color_RGB8 coopDefault;
+        if (tunic == PLAYER_TUNIC_KOKIRI) {
+            coopDefault.r = 0xC8; coopDefault.g = 0x14; coopDefault.b = 0x14;
+            sTemp = CVarGetColor24(CVAR_ENHANCEMENT("LocalCoop.P2.KokiriTunic.Value"), coopDefault);
+            color = &sTemp;
+        } else if (tunic == PLAYER_TUNIC_GORON) {
+            coopDefault.r = 0x40; coopDefault.g = 0x18; coopDefault.b = 0xA0;
+            sTemp = CVarGetColor24(CVAR_ENHANCEMENT("LocalCoop.P2.GoronTunic.Value"), coopDefault);
+            color = &sTemp;
+        } else if (tunic == PLAYER_TUNIC_ZORA) {
+            coopDefault.r = 0xE8; coopDefault.g = 0xC8; coopDefault.b = 0x30;
+            sTemp = CVarGetColor24(CVAR_ENHANCEMENT("LocalCoop.P2.ZoraTunic.Value"), coopDefault);
+            color = &sTemp;
+        }
+    }
+
     if (GameInteractor_Should(VB_APPLY_TUNIC_COLOR, true, data, color)) {
         gDPSetEnvColor(POLY_OPA_DISP++, color->r, color->g, color->b, 0);
     }
@@ -1248,6 +1294,22 @@ void func_8008F87C(PlayState* play, Player* this, SkelAnime* skelAnime, Vec3f* p
 s32 Player_OverrideLimbDrawGameplayCommon(PlayState* play, s32 limbIndex, Gfx** dList, Vec3f* pos, Vec3s* rot,
                                           void* thisx) {
     Player* this = (Player*)thisx;
+
+    // SoH multiplayer: head-only hide for first-person players' own view.
+    // The PiP block sets gCoopHideHeadFor = &<fp_player>->actor right
+    // before the actor-draw pass for that player's own viewport, then
+    // clears it right after. We skip the head limb only — body, hands,
+    // sheath, sword, shield etc. all still draw, so each player still
+    // sees their own body and equipment when they look down in aim
+    // mode. The OTHER player's view of the same player is unaffected
+    // (gCoopHideHeadFor is NULL outside the FP-player's own pass), so
+    // P1 sees P2's complete model and vice versa, matching the user's
+    // request for full inter-player visibility.
+    extern Actor* gCoopHideHeadFor;
+    if (limbIndex == PLAYER_LIMB_HEAD && gCoopHideHeadFor != NULL &&
+        &this->actor == gCoopHideHeadFor) {
+        *dList = NULL;
+    }
 
     if (CVarGetInteger(CVAR_ENHANCEMENT("EquipmentAlwaysVisible"), 0) &&
         CVarGetInteger(CVAR_ENHANCEMENT("ScaleAdultEquipmentAsChild"), 0) && LINK_IS_CHILD) {

@@ -10,6 +10,10 @@ struct Player;
 // Determines behavior when spawning. See `PlayerStartMode`.
 #define PLAYER_GET_START_MODE(thisx) (thisx->params & 0xF00) >> 8
 
+// SoH multiplayer: bits 12-15 of params encode player index (0 = primary).
+#define PLAYER_GET_INDEX(thisx)        (((thisx)->params >> 12) & 0xF)
+#define PLAYER_PARAMS_WITH_INDEX(p, i) ((p) | (((i) & 0xF) << 12))
+
 typedef enum PlayerStartMode {
     /*  0 */ PLAYER_START_MODE_NOTHING, // Update is empty and draw function is NULL, nothing occurs. Useful in cutscenes, for example.
     /*  1 */ PLAYER_START_MODE_TIME_TRAVEL, // Arriving from time travel. Automatically adjusts by age.

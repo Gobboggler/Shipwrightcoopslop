@@ -177,11 +177,27 @@ void ObjSyokudai_Update(Actor* thisx, PlayState* play2) {
             if (dmgFlags & 0x20820) {
                 interactionType = 1;
             }
-        } else if (player->heldItemAction == PLAYER_IA_DEKU_STICK) {
-            Math_Vec3f_Diff(&player->meleeWeaponInfo[0].tip, &this->actor.world.pos, &tipToFlame);
-            tipToFlame.y -= 67.0f;
-            if ((SQ(tipToFlame.x) + SQ(tipToFlame.y) + SQ(tipToFlame.z)) < SQ(20.0f)) {
-                interactionType = -1;
+        } else {
+            // SoH multiplayer: iterate through all players (P1 + any secondary
+            // players) and check if ANY of them are carrying a deku stick
+            // whose tip is touching the torch flame. Without this loop, only
+            // P1's stick can be lit at a torch — P2 holding an unlit stick
+            // gets no interaction. Whichever player's stick lights gets that
+            // player updated below.
+            Actor* coopPlayerActor;
+            for (coopPlayerActor = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+                 coopPlayerActor != NULL; coopPlayerActor = coopPlayerActor->next) {
+                Player* coopCheckPlayer = (Player*)coopPlayerActor;
+                if (coopCheckPlayer->heldItemAction == PLAYER_IA_DEKU_STICK) {
+                    Math_Vec3f_Diff(&coopCheckPlayer->meleeWeaponInfo[0].tip,
+                                    &this->actor.world.pos, &tipToFlame);
+                    tipToFlame.y -= 67.0f;
+                    if ((SQ(tipToFlame.x) + SQ(tipToFlame.y) + SQ(tipToFlame.z)) < SQ(20.0f)) {
+                        interactionType = -1;
+                        player = coopCheckPlayer;
+                        break;
+                    }
+                }
             }
         }
         if (interactionType != 0) {

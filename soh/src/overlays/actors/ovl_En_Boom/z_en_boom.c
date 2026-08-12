@@ -122,7 +122,21 @@ void EnBoom_Fly(EnBoom* this, PlayState* play) {
     Vec3f hitPoint;
     s32 pad2;
 
+    // SoH multiplayer: find the actual thrower of this boomerang (any
+    // player whose boomerangActor points to this actor) so the
+    // return-to-thrower path goes to the correct player. Defaults to
+    // GET_PLAYER (P1) for single-player.
     player = GET_PLAYER(play);
+    {
+        Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+        for (; coopP != NULL; coopP = coopP->next) {
+            Player* coopPlayer = (Player*)coopP;
+            if (coopPlayer->boomerangActor == &this->actor) {
+                player = coopPlayer;
+                break;
+            }
+        }
+    }
     target = this->moveTo;
 
     // If the boomerang is moving toward a targeted actor, handle setting the proper x and y angle to fly toward it.
@@ -240,7 +254,20 @@ void EnBoom_Fly(EnBoom* this, PlayState* play) {
 
 void EnBoom_Update(Actor* thisx, PlayState* play) {
     EnBoom* this = (EnBoom*)thisx;
+    // SoH multiplayer: find whichever player is the thrower (the one whose
+    // boomerangActor field points to this boomerang). Defaults to GET_PLAYER
+    // (P1) if no match — this preserves single-player behavior. With this,
+    // P2 can throw the boomerang and have it return to P2 instead of flying
+    // to P1.
     Player* player = GET_PLAYER(play);
+    Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
+    for (; coopP != NULL; coopP = coopP->next) {
+        Player* coopPlayer = (Player*)coopP;
+        if (coopPlayer->boomerangActor == &this->actor) {
+            player = coopPlayer;
+            break;
+        }
+    }
 
     if (!(player->stateFlags1 & PLAYER_STATE1_IN_CUTSCENE)) {
         this->actionFunc(this, play);
