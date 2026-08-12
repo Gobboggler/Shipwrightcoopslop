@@ -160,7 +160,12 @@ typedef struct EnHorse {
     /* 0x03D8 */ Vec3f frontLeftHoof;
     /* 0x03E4 */ Vec3f backRightHoof;
     /* 0x03F0 */ Vec3f backLeftHoof;
-} EnHorse; // size = 0x03FC
+    /* 0x03FC */ Player* coopOwner;
+    /* 0x0400 */ u32 coopCallToken;
+} EnHorse; // size = 0x0404
+
+Player* EnHorse_GetOwner(EnHorse* this, PlayState* play);
+void EnHorse_SetOwner(EnHorse* this, Player* player);
 
 #define EN_HORSE_CHECK_1(horseActor) \
     (((horseActor)->stateFlags & ENHORSE_FLAG_6)  \

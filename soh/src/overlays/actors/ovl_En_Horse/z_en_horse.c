@@ -11,6 +11,8 @@
 #include "scenes/overworld/spot09/spot09_scene.h"
 #include <assert.h>
 
+extern s32 gCoopP2CameraId;
+
 #define FLAGS ACTOR_FLAG_UPDATE_CULLING_DISABLED
 
 typedef void (*EnHorseCsFunc)(EnHorse*, PlayState*, CsCmdActorCue*);
@@ -79,6 +81,25 @@ const ActorInit En_Horse_InitVars = {
     (ActorFunc)EnHorse_Draw,
     NULL,
 };
+
+// A monotonically increasing token lets every Epona react to one whistle.
+// DREG(53) is a single global edge and cannot be consumed independently by
+// P1 and P2.
+u32 gCoopHorseCallToken = 0;
+
+Player* EnHorse_GetOwner(EnHorse* this, PlayState* play) {
+    if ((this->actor.child != NULL) && (this->actor.child->category == ACTORCAT_PLAYER)) {
+        return (Player*)this->actor.child;
+    }
+    if (this->coopOwner != NULL) {
+        return this->coopOwner;
+    }
+    return GET_PLAYER(play);
+}
+
+void EnHorse_SetOwner(EnHorse* this, Player* player) {
+    this->coopOwner = player;
+}
 
 static ColliderCylinderInit sCylinderInit1 = {
     {
@@ -681,7 +702,7 @@ s32 EnHorse_Spawn(EnHorse* this, PlayState* play) {
 
     for (i = 0; i < 169; i++) {
         if (sHorseSpawns[i].scene == play->sceneNum) {
-            player = GET_PLAYER(play);
+            player = EnHorse_GetOwner(this, play);
             if (play->sceneNum != SCENE_LON_LON_RANCH ||
                 //! Same flag checked twice
                 (Flags_GetEventChkInf(EVENTCHKINF_EPONA_OBTAINED) &&
@@ -703,7 +724,7 @@ s32 EnHorse_Spawn(EnHorse* this, PlayState* play) {
                     this->actor.world.pos.z = sHorseSpawns[i].pos.z;
                     this->actor.prevPos = this->actor.world.pos;
                     this->actor.world.rot.y = sHorseSpawns[i].angle;
-                    this->actor.shape.rot.y = Actor_WorldYawTowardActor(&this->actor, &GET_PLAYER(play)->actor);
+                    this->actor.shape.rot.y = Actor_WorldYawTowardActor(&this->actor, &player->actor);
                     spawn = true;
                     SkinMatrix_Vec3fMtxFMultXYZW(&play->viewProjectionMtxF, &this->actor.world.pos,
                                                  &this->actor.projectedPos, &this->actor.projectedW);
@@ -725,9 +746,9 @@ void EnHorse_ResetRace(EnHorse* this, PlayState* play) {
 }
 
 s32 EnHorse_PlayerCanMove(EnHorse* this, PlayState* play) {
-    Player* player = GET_PLAYER(play);
+    Player* player = EnHorse_GetOwner(this, play);
 
-    if ((player->stateFlags1 & PLAYER_STATE1_LOADING) || func_8002DD78(GET_PLAYER(play)) == 1 ||
+    if ((player->stateFlags1 & PLAYER_STATE1_LOADING) || func_8002DD78(player) == 1 ||
         (player->stateFlags1 & PLAYER_STATE1_FIRST_PERSON) || ((this->stateFlags & ENHORSE_FLAG_19) && !this->inRace) ||
         this->action == ENHORSE_ACT_HBA || player->actor.flags & ACTOR_FLAG_TALK || play->csCtx.state != 0) {
         return false;
@@ -753,6 +774,8 @@ void EnHorse_Init(Actor* thisx, PlayState* play2) {
     Actor_ProcessInitChain(&this->actor, sInitChain);
     EnHorse_ClearDustFlags(&this->dustFlags);
     DREG(53) = 0;
+    this->coopOwner = GET_PLAYER(play);
+    this->coopCallToken = gCoopHorseCallToken;
     this->riderPos = this->actor.world.pos;
     this->noInputTimer = 0;
     this->noInputTimerMax = 0;
@@ -911,7 +934,8 @@ void EnHorse_Destroy(Actor* thisx, PlayState* play) {
 }
 
 void EnHorse_RotateToPlayer(EnHorse* this, PlayState* play) {
-    EnHorse_RotateToPoint(this, play, &GET_PLAYER(play)->actor.world.pos, 400);
+    Player* player = EnHorse_GetOwner(this, play);
+    EnHorse_RotateToPoint(this, play, &player->actor.world.pos, 400);
     if (this->stateFlags & ENHORSE_OBSTACLE) {
         this->actor.world.rot.y += 800.0f;
     }
@@ -1521,7 +1545,7 @@ void EnHorse_Reverse(EnHorse* this, PlayState* play) {
     f32 stickMag;
     s16 stickAngle;
     s16 turnAmount;
-    Player* player = GET_PLAYER(play);
+    Player* player = EnHorse_GetOwner(this, play);
 
     EnHorse_PlayWalkingSound(this);
     EnHorse_StickDirection(&this->curStick, &stickMag, &stickAngle);
@@ -1743,19 +1767,32 @@ void EnHorse_SetFollowAnimation(EnHorse* this, PlayState* play);
 
 void EnHorse_Inactive(EnHorse* this, PlayState* play2) {
     PlayState* play = play2;
+    Player* player = EnHorse_GetOwner(this, play);
+    Camera* camera;
 
     if (DREG(53) != 0 && this->type == HORSE_EPONA) {
         DREG(53) = 0;
+        gCoopHorseCallToken++;
+    }
+    if ((this->type == HORSE_EPONA) && (this->coopCallToken != gCoopHorseCallToken)) {
+        this->coopCallToken = gCoopHorseCallToken;
         if (EnHorse_Spawn(this, play) != 0) {
             Audio_PlaySoundGeneral(NA_SE_EV_HORSE_NEIGH, &this->actor.projectedPos, 4, &gSfxDefaultFreqAndVolScale,
                                    &gSfxDefaultFreqAndVolScale, &gSfxDefaultReverb);
             this->stateFlags &= ~ENHORSE_INACTIVE;
-            gSaveContext.horseData.scene = play->sceneNum;
+            if (PLAYER_GET_INDEX(&player->actor) == 0) {
+                gSaveContext.horseData.scene = play->sceneNum;
+            }
 
             // Focus the camera on Epona
-            Camera_SetParam(play->cameraPtrs[0], 8, this);
-            Camera_ChangeSetting(play->cameraPtrs[0], 0x38);
-            Camera_SetCameraData(play->cameraPtrs[0], 4, NULL, NULL, 0x51, 0, 0);
+            camera = (PLAYER_GET_INDEX(&player->actor) != 0 &&
+                      gCoopP2CameraId != SUBCAM_NONE &&
+                      play->cameraPtrs[gCoopP2CameraId] != NULL)
+                         ? play->cameraPtrs[gCoopP2CameraId]
+                         : play->cameraPtrs[MAIN_CAM];
+            Camera_SetParam(camera, 8, this);
+            Camera_ChangeSetting(camera, 0x38);
+            Camera_SetCameraData(camera, 4, NULL, NULL, 0x51, 0, 0);
         }
     }
     if (!(this->stateFlags & ENHORSE_INACTIVE)) {
@@ -1816,20 +1853,33 @@ void EnHorse_StartIdleRidable(EnHorse* this) {
 void EnHorse_StartMovingAnimation(EnHorse* this, s32 arg1, f32 arg2, f32 arg3);
 
 void EnHorse_Idle(EnHorse* this, PlayState* play) {
+    Player* player = EnHorse_GetOwner(this, play);
+    Camera* camera;
+
     this->actor.speedXZ = 0.0f;
     EnHorse_IdleAnimSounds(this, play);
 
     if (DREG(53) && this->type == HORSE_EPONA) {
         DREG(53) = 0;
+        gCoopHorseCallToken++;
+    }
+
+    if ((this->type == HORSE_EPONA) && (this->coopCallToken != gCoopHorseCallToken)) {
+        this->coopCallToken = gCoopHorseCallToken;
         if (!func_80A5BBBC(play, this, &this->actor.world.pos)) {
             if (EnHorse_Spawn(this, play)) {
                 Audio_PlaySoundGeneral(NA_SE_EV_HORSE_NEIGH, &this->actor.projectedPos, 4, &gSfxDefaultFreqAndVolScale,
                                        &gSfxDefaultFreqAndVolScale, &gSfxDefaultReverb);
                 this->followTimer = 0;
                 EnHorse_SetFollowAnimation(this, play);
-                Camera_SetParam(play->cameraPtrs[0], 8, this);
-                Camera_ChangeSetting(play->cameraPtrs[0], 0x38);
-                Camera_SetCameraData(play->cameraPtrs[0], 4, NULL, NULL, 0x51, 0, 0);
+                camera = (PLAYER_GET_INDEX(&player->actor) != 0 &&
+                          gCoopP2CameraId != SUBCAM_NONE &&
+                          play->cameraPtrs[gCoopP2CameraId] != NULL)
+                             ? play->cameraPtrs[gCoopP2CameraId]
+                             : play->cameraPtrs[MAIN_CAM];
+                Camera_SetParam(camera, 8, this);
+                Camera_ChangeSetting(camera, 0x38);
+                Camera_SetCameraData(camera, 4, NULL, NULL, 0x51, 0, 0);
             }
         } else {
             Audio_PlaySoundGeneral(NA_SE_EV_HORSE_NEIGH, &this->actor.projectedPos, 4, &gSfxDefaultFreqAndVolScale,
@@ -1876,8 +1926,9 @@ void EnHorse_StartMovingAnimation(EnHorse* this, s32 animId, f32 morphFrames, f3
 void EnHorse_SetFollowAnimation(EnHorse* this, PlayState* play) {
     s32 animId = ENHORSE_ANIM_WALK;
     f32 distToPlayer;
+    Player* player = EnHorse_GetOwner(this, play);
 
-    distToPlayer = Actor_WorldDistXZToActor(&this->actor, &GET_PLAYER(play)->actor);
+    distToPlayer = Actor_WorldDistXZToActor(&this->actor, &player->actor);
     if (distToPlayer > 400.0f) {
         animId = ENHORSE_ANIM_GALLOP;
     } else if (!(distToPlayer <= 300.0f)) {
@@ -1913,16 +1964,17 @@ void EnHorse_SetFollowAnimation(EnHorse* this, PlayState* play) {
 void EnHorse_FollowPlayer(EnHorse* this, PlayState* play) {
     f32 distToPlayer;
     f32 angleDiff;
+    Player* player = EnHorse_GetOwner(this, play);
 
     DREG(53) = 0;
-    distToPlayer = Actor_WorldDistXZToActor(&this->actor, &GET_PLAYER(play)->actor);
+    distToPlayer = Actor_WorldDistXZToActor(&this->actor, &player->actor);
 
     // First rotate if the player is behind
     if ((this->playerDir == PLAYER_DIR_BACK_R || this->playerDir == PLAYER_DIR_BACK_L) &&
         (distToPlayer > 300.0f && !(this->stateFlags & ENHORSE_TURNING_TO_PLAYER))) {
         this->animationIdx = ENHORSE_ANIM_REARING;
         this->stateFlags |= ENHORSE_TURNING_TO_PLAYER;
-        this->angleToPlayer = Actor_WorldYawTowardActor(&this->actor, &GET_PLAYER(play)->actor);
+        this->angleToPlayer = Actor_WorldYawTowardActor(&this->actor, &player->actor);
         angleDiff = (f32)this->angleToPlayer - (f32)this->actor.world.rot.y;
         if (angleDiff > 32767.f) {
             angleDiff -= 32767.0f;
@@ -2585,7 +2637,7 @@ void EnHorse_InitFleePlayer(EnHorse* this) {
 }
 
 void EnHorse_FleePlayer(EnHorse* this, PlayState* play) {
-    Player* player = GET_PLAYER(play);
+    Player* player = EnHorse_GetOwner(this, play);
     f32 distToHome;
     f32 playerDistToHome;
     f32 distToPlayer;
@@ -3019,11 +3071,11 @@ s32 EnHorse_GetMountSide(EnHorse* this, PlayState* play);
 void EnHorse_MountDismount(EnHorse* this, PlayState* play) {
     s32 pad[2];
     s32 mountSide;
-    Player* player = GET_PLAYER(play);
+    Player* player = EnHorse_GetOwner(this, play);
 
     mountSide = EnHorse_GetMountSide(this, play);
     if (mountSide != 0 && !(this->stateFlags & ENHORSE_UNRIDEABLE) && player->rideActor == NULL) {
-        Actor_SetRideActor(play, &this->actor, mountSide);
+        Actor_SetRideActorForPlayer(play, player, &this->actor, mountSide);
     }
 
     if (this->playerControlled == false && Actor_IsMounted(play, &this->actor) == true) {
@@ -3060,10 +3112,13 @@ void EnHorse_StickDirection(Vec2f* curStick, f32* stickMag, s16* angle) {
 }
 
 void EnHorse_UpdateStick(EnHorse* this, PlayState* play) {
+    Player* player = EnHorse_GetOwner(this, play);
+
     this->lastStick = this->curStick;
     this->curStick.x =
-        play->state.input[0].rel.stick_x * (CVarGetInteger(CVAR_ENHANCEMENT("MirroredWorld"), 0) ? -1 : 1);
-    this->curStick.y = play->state.input[0].rel.stick_y;
+        play->state.input[PLAYER_GET_INDEX(&player->actor)].rel.stick_x *
+        (CVarGetInteger(CVAR_ENHANCEMENT("MirroredWorld"), 0) ? -1 : 1);
+    this->curStick.y = play->state.input[PLAYER_GET_INDEX(&player->actor)].rel.stick_y;
 }
 
 void EnHorse_ResolveCollision(EnHorse* this, PlayState* play, CollisionPoly* colPoly) {
@@ -3321,10 +3376,12 @@ void EnHorse_CheckBoost(EnHorse* thisx, PlayState* play2) {
     EnHorse* this = (EnHorse*)thisx;
     PlayState* play = play2;
     s32 pad;
+    Player* player = EnHorse_GetOwner(this, play);
 
     if (this->action == ENHORSE_ACT_MOUNTED_WALK || this->action == ENHORSE_ACT_MOUNTED_TROT ||
         this->action == ENHORSE_ACT_MOUNTED_GALLOP) {
-        if (CHECK_BTN_ALL(play->state.input[0].press.button, BTN_A) && (play->interfaceCtx.unk_1EE == 8)) {
+        if (CHECK_BTN_ALL(play->state.input[PLAYER_GET_INDEX(&player->actor)].press.button, BTN_A) &&
+            (play->interfaceCtx.unk_1EE == 8)) {
             if (!(this->stateFlags & ENHORSE_BOOST) && !(this->stateFlags & ENHORSE_FLAG_8) &&
                 !(this->stateFlags & ENHORSE_FLAG_9)) {
                 if (this->numBoosts > 0) {
@@ -3412,7 +3469,8 @@ void EnHorse_UpdatePlayerDir(EnHorse* this, PlayState* play) {
     f32 s;
     f32 c;
 
-    angle = Actor_WorldYawTowardActor(&this->actor, &GET_PLAYER(play)->actor) - this->actor.world.rot.y;
+    Player* player = EnHorse_GetOwner(this, play);
+    angle = Actor_WorldYawTowardActor(&this->actor, &player->actor) - this->actor.world.rot.y;
     s = Math_SinS(angle);
     c = Math_CosS(angle);
     if (s > 0.8660254f) { // sin(60 degrees)
@@ -3461,7 +3519,7 @@ void EnHorse_TiltBody(EnHorse* this, PlayState* play) {
 }
 
 s32 EnHorse_UpdateConveyors(EnHorse* this, PlayState* play) {
-    Player* player = GET_PLAYER(play);
+    Player* player = EnHorse_GetOwner(this, play);
     s16 conveyorDir;
 
     if ((this->actor.floorPoly == NULL) && (this != (EnHorse*)player->rideActor)) {
@@ -3490,7 +3548,7 @@ void EnHorse_Update(Actor* thisx, PlayState* play2) {
     PlayState* play = play2;
     Vec3f dustAcc = { 0.0f, 0.0f, 0.0f };
     Vec3f dustVel = { 0.0f, 1.0f, 0.0f };
-    Player* player = GET_PLAYER(play);
+    Player* player = EnHorse_GetOwner(this, play);
 
     this->lastYaw = thisx->shape.rot.y;
     EnHorse_UpdateStick(this, play);
@@ -3669,7 +3727,7 @@ s32 EnHorse_GetMountSide(EnHorse* this, PlayState* play) {
     if ((this->animationIdx != ENHORSE_ANIM_IDLE) && (this->animationIdx != ENHORSE_ANIM_WHINNEY)) {
         return 0;
     }
-    return EnHorse_MountSideCheck(this, play, GET_PLAYER(play));
+    return EnHorse_MountSideCheck(this, play, EnHorse_GetOwner(this, play));
 }
 
 void EnHorse_RandomOffset(Vec3f* src, f32 dist, Vec3f* dst) {

@@ -1,4 +1,5 @@
 #include "global.h"
+#include "overlays/actors/ovl_En_Horse/z_en_horse.h"
 #include "vt.h"
 #include <assert.h>
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
@@ -127,34 +128,35 @@ void func_8006D0EC(PlayState* play, Player* player) {
         }
     }
 
-    // SoH multiplayer (Tier 2): give P2 their own Epona once unlocked. Only
-    // fires in horse-allowed scenes (matches Horse_CanSpawn logic) and when
-    // co-op is enabled. The second horse spawns offset from P1 so the two
-    // don't intersect; vanilla mount logic handles the "walk up + press A"
-    // interaction without modification, since En_Horse supports multiple
-    // independent instances per scene (used in the Ingo race).
-    if (CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0) &&
-        Flags_GetEventChkInf(EVENTCHKINF_EPONA_OBTAINED) &&
-        Horse_CanSpawn(play->sceneNum)) {
-        Actor* coopP = play->actorCtx.actorLists[ACTORCAT_PLAYER].head;
-        for (; coopP != NULL; coopP = coopP->next) { if (coopP->category != ACTORCAT_PLAYER || PLAYER_GET_INDEX(coopP) == 0) continue;
-            if (coopP->category != ACTORCAT_PLAYER) continue;
-            // Sanity: skip if player position is bad
-            if (coopP->world.pos.x != coopP->world.pos.x) continue;
-            if (coopP->world.pos.y != coopP->world.pos.y) continue;
-            if (coopP->world.pos.z != coopP->world.pos.z) continue;
-            // Spawn P2's horse 80 units to the right of P1's horse, same Y.
-            // Using params=1 (basic mountable horse). We don't tag with a
-            // player index — vanilla handles "nearest player mounts" naturally.
-            Actor* coopHorse = Actor_Spawn(&play->actorCtx, play, ACTOR_EN_HORSE,
-                                           player->actor.world.pos.x + 80.0f,
-                                           player->actor.world.pos.y,
-                                           player->actor.world.pos.z,
-                                           0, player->actor.shape.rot.y, 0, 1);
-            if (coopHorse != NULL && play->sceneNum == SCENE_GERUDOS_FORTRESS) {
-                coopHorse->room = -1;
-            }
-            break;  // only spawn one extra horse (one per non-P1 player)
+}
+
+void Coop_EnsureP2Horse(PlayState* play, Player* player) {
+    Actor* actor;
+    Actor* horseActor;
+
+    if (!CVarGetInteger(CVAR_ENHANCEMENT("LocalCoop.Enabled"), 0) ||
+        (player == NULL) || (PLAYER_GET_INDEX(&player->actor) == 0) ||
+        !Flags_GetEventChkInf(EVENTCHKINF_EPONA_OBTAINED) || !func_8006CFC0(play->sceneNum)) {
+        return;
+    }
+
+    actor = play->actorCtx.actorLists[ACTORCAT_BG].head;
+    while (actor != NULL) {
+        if ((actor->id == ACTOR_EN_HORSE) && (((EnHorse*)actor)->coopOwner == player)) {
+            return;
+        }
+        actor = actor->next;
+    }
+
+    horseActor = Actor_Spawn(&play->actorCtx, play, ACTOR_EN_HORSE,
+                             player->actor.world.pos.x + 80.0f,
+                             player->actor.world.pos.y,
+                             player->actor.world.pos.z,
+                             0, player->actor.shape.rot.y, 0, 1);
+    if (horseActor != NULL) {
+        EnHorse_SetOwner((EnHorse*)horseActor, player);
+        if (play->sceneNum == SCENE_GERUDOS_FORTRESS) {
+            horseActor->room = -1;
         }
     }
 }

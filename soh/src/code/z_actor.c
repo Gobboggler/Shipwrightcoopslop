@@ -1593,7 +1593,7 @@ void func_8002DE04(PlayState* play, Actor* actorA, Actor* actorB) {
 
 void func_8002DE74(PlayState* play, Player* player) {
     if ((play->roomCtx.curRoom.behaviorType1 != ROOM_BEHAVIOR_TYPE1_4) && func_800C0CB8(play)) {
-        Camera_ChangeSetting(Play_GetCamera(play, MAIN_CAM), CAM_SET_HORSE);
+        Camera_ChangeSetting(Play_GetCamera(play, SUBCAM_ACTIVE), CAM_SET_HORSE);
     }
 }
 
@@ -2346,6 +2346,11 @@ s32 Actor_IsMounted(PlayState* play, Actor* horse) {
 
 u32 Actor_SetRideActor(PlayState* play, Actor* horse, s32 mountSide) {
     Player* player = GET_PLAYER(play);
+
+    return Actor_SetRideActorForPlayer(play, player, horse, mountSide);
+}
+
+u32 Actor_SetRideActorForPlayer(PlayState* play, Player* player, Actor* horse, s32 mountSide) {
 
     if (!(player->stateFlags1 &
           (PLAYER_STATE1_DEAD | PLAYER_STATE1_CARRYING_ACTOR | PLAYER_STATE1_CHARGING_SPIN_ATTACK |

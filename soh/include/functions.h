@@ -424,6 +424,8 @@ s32 func_8002DDF4(PlayState* play);
 void func_8002DE04(PlayState* play, Actor* actorA, Actor* actorB);
 void func_8002DE74(PlayState* play, Player* player);
 void Actor_MountHorse(PlayState* play, Player* player, Actor* horse);
+u32 Actor_SetRideActorForPlayer(PlayState* play, Player* player, Actor* horse, s32 mountSide);
+void Coop_EnsureP2Horse(PlayState* play, Player* player);
 s32 func_8002DEEC(Player* player);
 void func_8002DF18(PlayState* play, Player* player);
 s32 func_8002DF38(PlayState* play, Actor* actor, u8 csMode);

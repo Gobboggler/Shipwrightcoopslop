@@ -11280,6 +11280,7 @@ void Player_Init(Actor* thisx, PlayState* play2) {
             // without ACTIVE status. Vanilla camera *mode* still gates
             // the PiP behavior (third-person vs aim) via gCoopP2InAimMode.
         }
+        Coop_EnsureP2Horse(play, this);
         return;
     }
 
@@ -13474,6 +13475,8 @@ void Player_Update(Actor* thisx, PlayState* play) {
             Player_SetInvulnerability(this, -20);
         }
 
+        Coop_EnsureP2Horse(play, this);
+
         s32 coopP1InTransition = (coopP1 != NULL) &&
             ((coopP1->stateFlags1 & (PLAYER_STATE1_IN_CUTSCENE | PLAYER_STATE1_DEAD)) ||
              (coopP1->stateFlags2 & PLAYER_STATE2_CRAWLING));
@@ -15213,7 +15216,8 @@ void Player_Action_8084D3E4(Player* this, PlayState* play) {
         this->actor.parent = NULL;
         AREG(6) = 0;
 
-        if (Flags_GetEventChkInf(EVENTCHKINF_EPONA_OBTAINED) || (DREG(1) != 0)) {
+        if ((PLAYER_GET_INDEX(&this->actor) == 0) &&
+            (Flags_GetEventChkInf(EVENTCHKINF_EPONA_OBTAINED) || (DREG(1) != 0))) {
             gSaveContext.horseData.pos.x = rideActor->actor.world.pos.x;
             gSaveContext.horseData.pos.y = rideActor->actor.world.pos.y;
             gSaveContext.horseData.pos.z = rideActor->actor.world.pos.z;
