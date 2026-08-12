@@ -246,7 +246,13 @@ jobs:
         (cd build-cmake && cpack -G External)
 
         mv README.md readme.txt
-        mv build-cmake/*.appimage soh.appimage
+        appimage=$(find build-cmake _packages -type f -iname '*.appimage' -print -quit)
+        if [ -z "$appimage" ]; then
+          echo "CPack did not produce an AppImage. Files in the package directories:"
+          find build-cmake _packages -maxdepth 4 -type f -print
+          exit 1
+        fi
+        mv "$appimage" soh.appimage
       env:
         CC: gcc-12
         CXX: g++-12
